@@ -28,6 +28,10 @@ _recognizer = sr.Recognizer()
 # browse the full catalog and pick whatever sounds most JARVIS to you.
 VOICE = "en-GB-RyanNeural"
 
+# "+0%" is normal speed. Bump this up to talk faster -- "+25%" is a
+# noticeable but still natural-sounding speedup, "+50%" starts to feel rushed.
+RATE = "+25%"
+
 
 def listen(prompt="Listening... (speak now)"):
     """Record from the mic until you stop talking, then transcribe it."""
@@ -42,7 +46,7 @@ def listen(prompt="Listening... (speak now)"):
 
 
 async def _speak_async(text):
-    communicate = edge_tts.Communicate(text, voice=VOICE)
+    communicate = edge_tts.Communicate(text, voice=VOICE, rate=RATE)
 
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
         temp_path = f.name

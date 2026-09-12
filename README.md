@@ -46,7 +46,7 @@ Tool calling (the LLM actually deciding to create an event) works far
 more reliably on a bigger model than 1.5B — pull the 7B version:
 
 ```bash
-ollama pull qwen2.5:1.5b
+ollama pull qwen2.5:7b
 ```
 
 If your machine can't comfortably run 7B, you can drop `MODEL` back to

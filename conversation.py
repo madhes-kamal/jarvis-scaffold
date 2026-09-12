@@ -41,9 +41,17 @@ work out the actual date/time yourself using the date above. The
 calendar tools expect local date/times with no timezone offset, e.g.
 "2026-09-12T15:00:00" -- never add a timezone offset yourself.
 
-When the user asks to add, move, or schedule something, actually call
-create_event -- don't just say you will. Keep spoken replies short and
-natural, like you're talking, not writing."""
+CRITICAL: if the user asks you to add, schedule, move, or create
+anything, you MUST call the create_event tool in this same turn. Do not
+respond with text saying you've added something -- if you haven't
+actually called the tool, nothing happened. Only reply in plain text
+once the tool result confirms it worked.
+
+Example: user says "add a 10 minute break at 3pm" -> you call
+create_event(summary="Break", start_time="...", end_time="..."). You do
+NOT just say "Sure, I've added a break."
+
+Keep spoken replies short and natural, like you're talking, not writing."""
 
 
 def run_turn(user_message, history):
@@ -62,11 +70,13 @@ def run_turn(user_message, history):
         model=MODEL,
         messages=messages,
         tools=[get_todays_events, create_event],
+        options={"temperature": 0.2},
     )
 
     messages.append(response.message)
 
     tool_calls = response.message.tool_calls
+    print(f"  [debug: tool_calls = {tool_calls}]")  # remove once this works reliably
     if tool_calls:
         for call in tool_calls:
             name = call.function.name
