@@ -1,16 +1,16 @@
-# JARVIS Scaffold — Terminal Morning Brief
+# JARVIS Scaffold — Voice + Calendar Read/Write
 
-The first building block: a script that reads today's Google Calendar
-events and asks a local LLM (via Ollama) to turn them into a casual,
-spoken-style summary. No voice, no hardware, no paid API — this just
-proves the core loop works, for free.
+Talk to it, and it can actually change your calendar (not just read it),
+using tool calling: the LLM decides when to call `create_event` based on
+what you say, instead of you writing if/else logic for every phrase.
 
 ## What's here
 
-- `calendar_service.py` — Google Calendar OAuth + fetching today's events
-- `brief_generator.py` — sends events to a local Ollama model, gets back a casual summary
-- `main.py` — ties the two together; this is the one you run
-- `requirements.txt` — Python dependencies
+- `calendar_service.py` — Google Calendar OAuth, reading today's events, and `create_event`
+- `brief_generator.py` — tuned, low-temperature, anti-hallucination morning briefing (used only when you say "good morning")
+- `conversation.py` — general chat turn with tool calling, for everything else (asking questions, adding/changing events)
+- `voice.py` — speech-to-text (Whisper, local) and text-to-speech (pyttsx3, local)
+- `main.py` — the voice loop; routes "good morning" to the tuned brief, everything else to general conversation
 
 ## Setup
 
@@ -22,20 +22,37 @@ source venv/bin/activate   # on Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### 2. Google Calendar API access
+**PyAudio is the one dependency that sometimes fights back** (it wraps a
+system audio library, not pure Python):
+- **Mac**: `brew install portaudio` first, then re-run pip install
+- **Windows**: if the normal install fails, `pip install pipwin` then `pipwin install pyaudio`
+- **Linux**: `sudo apt-get install portaudio19-dev` first, then re-run pip install
 
-1. Go to https://console.cloud.google.com/ and create a new project (or use an existing one).
-2. Go to "APIs & Services" → "Library", search for "Google Calendar API", and enable it.
-3. Go to "APIs & Services" → "Credentials" → "Create Credentials" → "OAuth client ID".
-4. If prompted, configure the OAuth consent screen first: choose "External", fill in the required basics (app name, your email), and add your own Google account as a "test user". You don't need to publish the app.
-5. For the OAuth client ID, choose **Application type: Desktop app**.
-6. Download the resulting JSON file, rename it `credentials.json`, and put it in this folder.
+### 2. Google Calendar — re-authorize with the new permissions
 
-### 3. Ollama (free, local, no API key)
+This version needs write access to calendar *events* specifically
+(`calendar.events` scope). If you already ran an earlier version with a
+different scope, **delete `token.json`** in this folder before running —
+an old token won't carry the new permissions. You'll be asked to log in
+again the first time you run it.
 
-1. Download and install from https://ollama.com
-2. Pull the model: `ollama pull qwen2.5:1.5b` (try `qwen2.5:7b` instead if you want better quality — your laptop can handle more than the Pi will)
-3. That's it — Ollama runs a local server in the background automatically once installed
+(If you haven't set up `credentials.json` yet at all, see the earlier
+setup steps: Google Cloud Console → enable Calendar API → OAuth client ID
+→ Desktop app → download as `credentials.json`.)
+
+### 3. Ollama model
+
+Tool calling (the LLM actually deciding to create an event) works far
+more reliably on a bigger model than 1.5B — pull the 7B version:
+
+```bash
+ollama pull qwen2.5:7b
+```
+
+If your machine can't comfortably run 7B, you can drop `MODEL` back to
+`qwen2.5:1.5b` in `conversation.py`, but watch for it claiming to add
+events without actually calling the tool — check your real calendar to
+confirm, don't just trust what it says out loud.
 
 ### 4. Run it
 
@@ -43,28 +60,38 @@ pip install -r requirements.txt
 python main.py
 ```
 
-First run opens a browser window asking you to log into Google and approve
-calendar access. Since the OAuth consent screen isn't "verified" (fine for
-a personal project only you use), you'll likely see an "unverified app"
-warning — click "Advanced" → "Go to [app name] (unsafe)". After approving,
-a `token.json` file is saved so future runs skip the login step.
+Press Enter, then talk. Try:
+- "What's on my calendar today?"
+- "Add a 5 minute scrolling break starting now"
+- "Schedule a 30 minute study session at 3pm called Focus block"
 
-## Debugging tips (since you're newer to backend)
+Type `quit` (no talking) to exit.
 
-- Run `python calendar_service.py` on its own first — it just prints your
-  events, no LLM involved. If this fails, the problem is Google auth, not
-  Claude.
-- Run `python brief_generator.py` on its own next — it uses fake calendar
-  data, no Google auth involved. If this fails, check that Ollama is
-  actually running (`ollama list` should show `qwen2.5:1.5b`) before
-  suspecting your code.
-- Only run `python main.py` once both of the above work individually —
-  it's just those two pieces combined.
+## Debugging tips
+
+- If tool calls aren't happening at all, run `python conversation.py`
+  interactively in a Python shell to test just the LLM + tools, without
+  voice in the way:
+  ```python
+  from conversation import run_turn
+  reply, history = run_turn("add a break at 3pm for 10 minutes", [])
+  print(reply)
+  ```
+- If voice transcription is garbled, try a bigger Whisper model in
+  `voice.py` (`model="small"` instead of `"base"`) — slower, more accurate.
+- If nothing happens when you talk, check your OS's microphone
+  permissions for your terminal/VS Code — this trips up a lot of people
+  on Mac and Windows.
+- Run `python brief_generator.py` on its own to see 3 sample briefings
+  back to back — good way to check the phrasing is varying while every
+  event/time stays identical across runs.
 
 ## What to try next
 
-- Swap the prompt in `brief_generator.py` to change the tone/personality
-- Add a `--speak` flag that pipes the output through a text-to-speech
-  library instead of printing it
-- Start sketching the focus state machine as its own module once this
-  feels solid
+- Give it an `update_event`/`delete_event` tool the same way `create_event`
+  works, so it can move or cancel things, not just add them
+- Start sketching the focus state machine as its own module — this is
+  where "be lenient about 5 minutes, strict after an hour" logic will live
+- Swap `pyttsx3` for a nicer-sounding local TTS (Piper) once the core
+  loop feels solid — same idea as the LLM model swap, better quality,
+  more setup
