@@ -106,15 +106,18 @@ def get_todays_events():
     return simplified
 
 
-def create_event(summary: str, start_time: str, end_time: str) -> str:
-    """Create a new event on the user's Google Calendar.
+def create_event(event_description: str) -> str:
+    """Create a calendar event from a natural-language description, the
+    same way a person would type it into Google Calendar's quick-add box.
+
+    Google parses the date, time, and title itself -- do NOT convert
+    anything to ISO format or compute a timezone offset. Just pass
+    through a natural description of what the user asked for.
 
     Args:
-        summary: Short title for the event, e.g. "Scrolling break".
-        start_time: Local date and time, NO timezone offset needed,
-            e.g. "2026-09-12T15:00:00". Your system's local timezone is
-            attached automatically.
-        end_time: Local date and time in the same format as start_time.
+        event_description: A natural-language description including the
+            title and time, e.g. "Dinner today from 7:15pm to 8pm" or
+            "Break tomorrow 3pm to 3:10pm".
 
     Returns:
         A short confirmation string.
@@ -122,21 +125,11 @@ def create_event(summary: str, start_time: str, end_time: str) -> str:
     creds = _get_credentials()
     service = build("calendar", "v3", credentials=creds)
 
-    local_tz = datetime.datetime.now().astimezone().tzinfo
-    start_dt = datetime.datetime.fromisoformat(start_time).replace(tzinfo=local_tz)
-    end_dt = datetime.datetime.fromisoformat(end_time).replace(tzinfo=local_tz)
+    created = service.events().quickAdd(
+        calendarId="primary", text=event_description
+    ).execute()
 
-    event = {
-        "summary": summary,
-        "start": {"dateTime": start_dt.isoformat()},
-        "end": {"dateTime": end_dt.isoformat()},
-    }
-
-    service.events().insert(calendarId="primary", body=event).execute()
-    return (
-        f"Created '{summary}' from {start_dt.strftime('%I:%M %p')} "
-        f"to {end_dt.strftime('%I:%M %p')}."
-    )
+    return f"Added: {created.get('summary', event_description)}"
 
 
 if __name__ == "__main__":
