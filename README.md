@@ -7,10 +7,10 @@ what you say, instead of you writing if/else logic for every phrase.
 ## What's here
 
 - `calendar_service.py` — Google Calendar OAuth, reading today's events, and `create_event`
-- `brief_generator.py` — tuned, low-temperature, anti-hallucination morning briefing (used only when you say "good morning")
+- `brief_generator.py` — builds the morning briefing from templates in Python (no LLM involved — guarantees accuracy, used only when you say "good morning")
 - `conversation.py` — general chat turn with tool calling, for everything else (asking questions, adding/changing events)
-- `voice.py` — speech-to-text (Whisper, local) and text-to-speech (pyttsx3, local)
-- `main.py` — the voice loop; routes "good morning" to the tuned brief, everything else to general conversation
+- `voice.py` — speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
+- `main.py` — the voice loop; routes "good morning" to the templated brief, everything else to general conversation
 
 ## Setup
 
@@ -46,7 +46,7 @@ Tool calling (the LLM actually deciding to create an event) works far
 more reliably on a bigger model than 1.5B — pull the 7B version:
 
 ```bash
-ollama pull qwen2.5:7b
+ollama pull qwen2.5:1.5b
 ```
 
 If your machine can't comfortably run 7B, you can drop `MODEL` back to
@@ -82,9 +82,10 @@ Type `quit` (no talking) to exit.
 - If nothing happens when you talk, check your OS's microphone
   permissions for your terminal/VS Code — this trips up a lot of people
   on Mac and Windows.
-- Run `python brief_generator.py` on its own to see 3 sample briefings
-  back to back — good way to check the phrasing is varying while every
-  event/time stays identical across runs.
+- Run `python brief_generator.py` on its own to see 5 sample briefings
+  back to back — good way to confirm the phrasing varies while every
+  event/time stays word-for-word identical across runs (it's templated,
+  not LLM-generated, so this should always hold).
 
 ## What to try next
 

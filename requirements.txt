@@ -4,6 +4,7 @@ google-api-python-client
 ollama
 SpeechRecognition
 openai-whisper
-pyttsx3
-PyAudio
 soundfile
+edge-tts
+playsound==1.2.2
+PyAudio

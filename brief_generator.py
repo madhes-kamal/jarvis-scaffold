@@ -1,123 +1,95 @@
 """
 brief_generator.py
 
-Takes a list of calendar events and asks a local LLM (via Ollama) to turn
-them into a short, casual "morning brief".
+Builds the morning briefing entirely in Python from templates, rather than
+asking an LLM to write it.
 
-This runs entirely on your machine through Ollama -- no API key, no cost,
-no internet required once the model is downloaded.
-
-Variation without sacrificing accuracy: a small pool of STYLES controls
-phrasing/ordering only. The strict factual rules below apply identically
-regardless of which style gets picked, so the facts never drift, only
-how they're framed.
+Why: at low temperature (needed for accuracy), a small local model barely
+varies its own phrasing no matter what style hint you give it -- and
+raising the temperature to get variety reopens the door to hallucinating
+times/events. Templating sidesteps the trade-off entirely: the facts are
+inserted directly from your calendar data (impossible to get wrong,
+since there's no LLM in the path to misremember them), and variety comes
+from randomly combining openers/transitions/closers, which gives far
+more real variation than an LLM at temperature 0.1 ever produced anyway.
 """
 
-import datetime
 import random
 
-import ollama
+OPENERS = [
+    "Good morning, sir.",
+    "Morning, sir. Hope you slept well.",
+    "Rise and shine, sir.",
+    "Sir, good morning.",
+    "Morning, sir.",
+]
 
-# Set this to "qwen2.5:1.5b" or "qwen3:0.6b" depending on what you have pulled
-MODEL = "qwen2.5:1.5b"
+TRANSITIONS = [
+    "Then",
+    "After that",
+    "Following that",
+    "Next up",
+    "Once that wraps up",
+    "From there",
+    "Moving on",
+]
 
-STYLES = [
-    "Start with a quick one-line sense of how busy or light the day looks, then walk through the events in order.",
-    "Open with a brief, JARVIS-style greeting, then move straight into the first event and continue in order.",
-    "Lead with whichever event is happening soonest, then cover the rest in chronological order.",
-    "Start by stating how many things are on the schedule today, then list them in order.",
+CLOSERS = [
+    "That's the full picture for today, sir.",
+    "That covers everything on the books.",
+    "That's your day, sir.",
+    "That's the rundown.",
+    "That's everything on the schedule.",
+]
+
+NO_EVENTS_LINES = [
+    "There's nothing on the calendar today, sir -- a rare clean slate.",
+    "Good news, sir: your calendar is completely clear today.",
+    "Nothing scheduled today, sir.",
 ]
 
 
+def _format_event_list(events):
+    """Builds the factual portion of the brief. Every word describing an
+    event/time comes directly from `events` -- nothing here is generated
+    or guessed."""
+    parts = []
+    for i, e in enumerate(events):
+        if e["start"] == "All day":
+            time_str = "(all day)"
+        else:
+            time_str = f"from {e['start']} to {e['end']}"
+
+        if i == 0:
+            sentence = f"Today starts with {e['summary']} {time_str}"
+        else:
+            connector = random.choice(TRANSITIONS)
+            sentence = f"{connector}, there's {e['summary']} {time_str}"
+
+        parts.append(sentence.strip())
+
+    return ". ".join(parts) + "."
+
+
 def generate_brief(events):
-    today_date = datetime.datetime.now().strftime("%A, %B %d, %Y")
-    style_instruction = random.choice(STYLES)
-
     if not events:
-        events_text = "NO EVENTS TODAY"
-    else:
-        events_text = "\n".join(
-            f"{i + 1}. {e['summary']} | {e['start']} - {e['end']}"
-            if e["start"] != "All day"
-            else f"{i + 1}. {e['summary']} | ALL DAY"
-            for i, e in enumerate(events)
-        )
+        return f"{random.choice(OPENERS)} {random.choice(NO_EVENTS_LINES)}"
 
-    prompt = f"""You are JARVIS, an elegant and slightly witty AI personal assistant.
+    opener = random.choice(OPENERS)
+    closer = random.choice(CLOSERS)
+    body = _format_event_list(events)
 
-Create a short, natural, spoken-style morning briefing from the calendar data below.
-
-IMPORTANT — THE CALENDAR DATA IS FACT:
-- NEVER change a time.
-- NEVER change an event name.
-- NEVER invent an event.
-- NEVER remove an event.
-- NEVER combine events.
-- NEVER split events.
-- NEVER assume what an event means.
-- NEVER add activities that are not listed.
-- Keep every event in chronological order.
-- Mention every event exactly once.
-- You may only add natural connecting words around the calendar information.
-- Address the user as "sir".
-- Keep the response to 2-3 sentences.
-- Do not use bullet points or a list.
-
-STYLE FOR THIS BRIEFING (this changes phrasing and ordering only -- it
-never overrides the facts above):
-{style_instruction}
-
-Today's date:
-{today_date}
-
-CALENDAR EVENTS:
-{events_text}
-
-Generate the briefing now. Use ONLY the information provided above."""
-
-    response = ollama.chat(
-        model=MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a precise calendar assistant. "
-                    "Calendar events and times are immutable facts. "
-                    "Never alter, infer, or invent calendar information."
-                ),
-            },
-            {
-                "role": "user",
-                "content": prompt,
-            },
-        ],
-        options={
-            "temperature": 0.1,
-            "think": False,
-        },
-    )
-
-    raw_content = response.message.content
-
-    # If using a reasoning model, isolate and drop any internal monologue.
-    if "</think>" in raw_content:
-        clean_content = raw_content.split("</think>")[-1].strip()
-    else:
-        clean_content = raw_content.strip()
-
-    return clean_content
+    return f"{opener} {body} {closer}"
 
 
 if __name__ == "__main__":
-    # Test script in isolation with fake data. Runs it 3 times so you can
-    # see the phrasing vary while the facts stay identical.
-    print("Testing LLM generation with sample data (3 runs to show variation)...")
-
+    # Run this a few times -- the facts stay identical, the phrasing shifts.
     sample_events = [
         {"summary": "SAMPLE TASK", "start": "05:00 PM", "end": "05:45 PM"},
         {"summary": "SAMPLE TASK 2", "start": "05:45 PM", "end": "06:30 PM"},
     ]
 
-    for i in range(3):
-        print(f"\n--- Run {i + 1} ---")
+    for i in range(5):
+        print(f"--- Run {i + 1} ---")
         print(generate_brief(sample_events))
+        print()
