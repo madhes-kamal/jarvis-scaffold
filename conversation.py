@@ -18,9 +18,11 @@ import ollama
 from calendar_service import get_todays_events, create_event
 
 # Tool calling is noticeably more reliable on 7b than 1.5b -- a small
-# model will often *say* it added an event without actually calling the
-# tool. If you're stuck on 1.5b for speed/RAM reasons, double check
-# results land on your actual calendar, don't just trust the reply.
+# model will sometimes *say* it added an event without actually calling
+# the tool, or call it with malformed arguments. Set to 1.5b here
+# deliberately, since that's what you'd actually be running on the Pi --
+# keep watching for it silently skipping the tool call (see the debug
+# print in run_turn below).
 MODEL = "qwen2.5:1.5b"
 
 AVAILABLE_TOOLS = {
@@ -53,6 +55,41 @@ create_event(event_description="Break today from 3pm to 3:10pm"). You do
 NOT just say "Sure, I've added a break."
 
 Keep spoken replies short and natural, like you're talking, not writing."""
+
+
+def extract_event_phrase(user_text):
+    """
+    Turn spoken/messy phrasing into a clean quick-add-style phrase, e.g.
+    "Yo can you add a break from 715 to 8" -> "Break today from 7:15pm to 8pm".
+
+    This is plain text rewriting, NOT tool calling -- Python has already
+    decided (via keyword detection in main.py) that an event needs to be
+    created. We're not asking the model to decide anything here, just to
+    reformat text, which small models handle far more reliably than
+    deciding-to-call-a-function-with-correct-JSON.
+    """
+    now = datetime.datetime.now()
+    response = ollama.chat(
+        model=MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    f"Today is {now.strftime('%A, %B %d, %Y, %I:%M %p')}. "
+                    "Rewrite the user's message into a short calendar "
+                    "quick-add phrase: event title, then the date/time. "
+                    "Resolve relative times ('tomorrow', 'in an hour') "
+                    "into an actual day/time using today's date above. "
+                    "Output ONLY the phrase itself -- no commentary, no "
+                    "quotes, no explanation. "
+                    "Example output: 'Break today from 7:15pm to 8pm'"
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ],
+        options={"temperature": 0.1},
+    )
+    return response.message.content.strip()
 
 
 def run_turn(user_message, history):
