@@ -6,6 +6,5 @@ dateparser
 SpeechRecognition
 openai-whisper
 soundfile
-edge-tts
-playsound==1.2.2
+piper-tts
 PyAudio

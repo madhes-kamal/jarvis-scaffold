@@ -11,7 +11,7 @@ what you say, instead of you writing if/else logic for every phrase.
 - `brief_generator.py` — builds the morning briefing from templates in Python (no LLM involved — guarantees accuracy, used only when you say "good morning")
 - `conversation.py` — general chat fallback for anything not calendar-related, plus the phrase-cleanup helper `calendar_manager.py` reuses for create
 - `llm_client.py` — the single place every LLM call goes through; swap models or backends here, not in the other files
-- `voice.py` — speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
+- `voice.py` — speech-to-text (Whisper, local), Jarvis wake-word detection, and local Piper text-to-speech
 - `main.py` — the voice loop; ties everything above together
 
 ## Setup
@@ -55,15 +55,18 @@ line you need to change.
 ### 4. Run it
 
 ```bash
+python -m piper.download_voices --data-dir models en_GB-alan-medium
 python main.py
 ```
 
-Press Enter, then talk. Try:
+The first command downloads the Piper voice model into `models/`. Say
+"Jarvis" to wake it, then speak. You can also say the wake word and command
+in one utterance. Try:
 - "What's on my calendar today?"
 - "Add a 5 minute scrolling break starting now"
 - "Schedule a 30 minute study session at 3pm called Focus block"
 
-Type `quit` (no talking) to exit.
+Say "Jarvis, quit" to exit, or press Ctrl+C.
 
 ## Debugging tips
 
@@ -96,6 +99,3 @@ Type `quit` (no talking) to exit.
   works, so it can move or cancel things, not just add them
 - Start sketching the focus state machine as its own module — this is
   where "be lenient about 5 minutes, strict after an hour" logic will live
-- Swap `pyttsx3` for a nicer-sounding local TTS (Piper) once the core
-  loop feels solid — same idea as the LLM model swap, better quality,
-  more setup

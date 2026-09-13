@@ -103,7 +103,7 @@ def run_turn(user_message, history):
             args = call.function.arguments
             print(f"  [calling tool: {name}({args})]")
             func = AVAILABLE_TOOLS[name]
-            result = func(**args)
+            result = func() if name == "get_todays_events" else func(**args)
             messages.append({"role": "tool", "content": str(result), "name": name})
 
         follow_up = chat_completion(messages)
