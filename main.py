@@ -23,7 +23,7 @@ from calendar_manager import handle_calendar_request
 
 def main():
     history = []
-    calendar_context = {"last_event": None}
+    calendar_context = {"last_event": None, "pending": None}
     print("Press Enter to talk, or type 'quit' to exit.")
 
     while True:

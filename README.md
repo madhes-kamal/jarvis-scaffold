@@ -10,6 +10,7 @@ what you say, instead of you writing if/else logic for every phrase.
 - `calendar_manager.py` — classifies each request (create/read/update/delete/none) and resolves "that meeting" to a real event ID before acting; never lets the model guess at a destructive action
 - `brief_generator.py` — builds the morning briefing from templates in Python (no LLM involved — guarantees accuracy, used only when you say "good morning")
 - `conversation.py` — general chat fallback for anything not calendar-related, plus the phrase-cleanup helper `calendar_manager.py` reuses for create
+- `llm_client.py` — the single place every LLM call goes through; swap models or backends here, not in the other files
 - `voice.py` — speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
 - `main.py` — the voice loop; ties everything above together
 
@@ -43,17 +44,13 @@ setup steps: Google Cloud Console → enable Calendar API → OAuth client ID
 
 ### 3. Ollama model
 
-Tool calling (the LLM actually deciding to create an event) works far
-more reliably on a bigger model than 1.5B — pull the 7B version:
-
 ```bash
-ollama pull qwen2.5:7b
+ollama pull qwen3:1.7b
 ```
 
-If your machine can't comfortably run 7B, you can drop `MODEL` back to
-`qwen2.5:1.5b` in `conversation.py`, but watch for it claiming to add
-events without actually calling the tool — check your real calendar to
-confirm, don't just trust what it says out loud.
+The model name lives in exactly one place now: `llm_client.py`'s `MODEL`
+constant. To compare against Qwen2.5-1.5B again later, that's the only
+line you need to change.
 
 ### 4. Run it
 
