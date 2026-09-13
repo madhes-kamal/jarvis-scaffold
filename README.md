@@ -6,11 +6,12 @@ what you say, instead of you writing if/else logic for every phrase.
 
 ## What's here
 
-- `calendar_service.py` — Google Calendar OAuth, reading today's events, and `create_event`
+- `calendar_service.py` — Google Calendar OAuth, reading events (with real IDs), and low-level create/update/delete
+- `calendar_manager.py` — classifies each request (create/read/update/delete/none) and resolves "that meeting" to a real event ID before acting; never lets the model guess at a destructive action
 - `brief_generator.py` — builds the morning briefing from templates in Python (no LLM involved — guarantees accuracy, used only when you say "good morning")
-- `conversation.py` — general chat turn with tool calling, for everything else (asking questions, adding/changing events)
+- `conversation.py` — general chat fallback for anything not calendar-related, plus the phrase-cleanup helper `calendar_manager.py` reuses for create
 - `voice.py` — speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
-- `main.py` — the voice loop; routes "good morning" to the templated brief, everything else to general conversation
+- `main.py` — the voice loop; ties everything above together
 
 ## Setup
 
@@ -69,14 +70,19 @@ Type `quit` (no talking) to exit.
 
 ## Debugging tips
 
-- If tool calls aren't happening at all, run `python conversation.py`
-  interactively in a Python shell to test just the LLM + tools, without
-  voice in the way:
+- If tool calls aren't happening at all, test `calendar_manager.py` directly, without voice in the way:
   ```python
-  from conversation import run_turn
-  reply, history = run_turn("add a break at 3pm for 10 minutes", [])
+  from calendar_manager import handle_calendar_request
+  reply, ctx = handle_calendar_request("cancel my dentist appointment", {"last_event": None})
   print(reply)
   ```
+- The `[calendar intent: ...]` debug line prints on every calendar-shaped
+  message -- if it's classifying things wrong (e.g. calling a delete
+  request CREATE), that's the place to tighten the prompt in
+  `calendar_manager.py`'s `classify_intent`.
+- Event matching in `_find_candidates` is intentionally simple (word
+  overlap + hour matching) -- if it's failing to find an obvious event,
+  that function is the one to improve, not the LLM prompt.
 - If voice transcription is garbled, try a bigger Whisper model in
   `voice.py` (`model="small"` instead of `"base"`) — slower, more accurate.
 - If nothing happens when you talk, check your OS's microphone

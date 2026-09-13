@@ -50,11 +50,13 @@ def _get_credentials():
 
 
 def get_todays_events():
-    """Return today's events as a list of dicts: {summary, start, end}.
+    """Return today's events as a list of dicts:
+    {id, summary, start, end, start_iso, end_iso}.
 
-    Times come back as clean 12-hour strings (e.g. "05:00 PM") rather than
-    raw ISO datetimes, so the LLM never has to do timezone/format math to
-    speak them back naturally.
+    `start`/`end` are clean 12-hour display strings (e.g. "05:00 PM") for
+    speaking out loud. `start_iso`/`end_iso` are the real datetimes, kept
+    around so update/delete can target an exact event instead of
+    guessing from a description.
     """
     creds = _get_credentials()
     service = build("calendar", "v3", credentials=creds)
@@ -91,19 +93,52 @@ def get_todays_events():
             end_dt = datetime.datetime.fromisoformat(end_raw)
             start_clean = start_dt.strftime("%I:%M %p")
             end_clean = end_dt.strftime("%I:%M %p")
+            start_iso = start_dt.isoformat()
+            end_iso = end_dt.isoformat()
         except ValueError:
             start_clean = "All day"
             end_clean = ""
+            start_iso = start_raw
+            end_iso = end_raw
 
         simplified.append(
             {
+                "id": event["id"],
                 "summary": event.get("summary", "(no title)"),
                 "start": start_clean,
                 "end": end_clean,
+                "start_iso": start_iso,
+                "end_iso": end_iso,
             }
         )
 
     return simplified
+
+
+def delete_event(event_id: str) -> str:
+    """Delete an event by its ID. Never called with a description --
+    the caller (calendar_manager.py) must resolve a description to a
+    real ID first, so we never delete the wrong thing on a guess."""
+    creds = _get_credentials()
+    service = build("calendar", "v3", credentials=creds)
+    service.events().delete(calendarId="primary", eventId=event_id).execute()
+    return "Deleted."
+
+
+def update_event(event_id: str, new_start_iso: str = None, new_end_iso: str = None) -> str:
+    """Update an event's time by its ID. Only pass the fields you want
+    changed; ISO strings should already include a timezone offset."""
+    creds = _get_credentials()
+    service = build("calendar", "v3", credentials=creds)
+
+    body = {}
+    if new_start_iso:
+        body["start"] = {"dateTime": new_start_iso}
+    if new_end_iso:
+        body["end"] = {"dateTime": new_end_iso}
+
+    service.events().patch(calendarId="primary", eventId=event_id, body=body).execute()
+    return "Updated."
 
 
 def create_event(event_description: str) -> str:
