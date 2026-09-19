@@ -11,8 +11,10 @@ Flow for every message:
 3. If it wasn't calendar-related (and wasn't just "good morning" on its
    own), fall through to general conversation.
 
-Type 'quit' and press Enter (no talking needed) to exit.
+Press Ctrl+C to exit.
 """
+
+import re
 
 from voice import listen, speak
 from calendar_service import get_todays_events
@@ -24,15 +26,22 @@ from calendar_manager import handle_calendar_request
 def main():
     history = []
     calendar_context = {"last_event": None, "pending": None}
-    print("Press Enter to talk, or type 'quit' to exit.")
+    print("Listening for 'Hey Jarvis'. Press Ctrl+C to exit.")
 
     while True:
-        typed = input("\n[Enter to talk] ")
-        if typed.strip().lower() == "quit":
-            break
+        user_text = listen(show_status=False)
 
-        user_text = listen()
-        print(f"You said: {user_text}")
+        wake_match = re.search(r"\bhey\s+jarvis\b", user_text, re.IGNORECASE)
+        if not wake_match:
+            continue
+
+        user_text = re.sub(
+            r"\bhey\s+jarvis\b[:,]?\s*", "", user_text, count=1, flags=re.IGNORECASE
+        ).strip()
+        if not user_text:
+            user_text = listen(show_status=False)
+            if not user_text.strip():
+                continue
 
         said_good_morning = "good morning" in user_text.lower()
         if said_good_morning:

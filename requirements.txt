@@ -4,7 +4,7 @@ google-api-python-client
 ollama
 dateparser
 SpeechRecognition
-openai-whisper
+faster-whisper
 soundfile
 edge-tts
 playsound==1.2.2

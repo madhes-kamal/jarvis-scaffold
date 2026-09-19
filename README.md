@@ -58,12 +58,12 @@ line you need to change.
 python main.py
 ```
 
-Press Enter, then talk. Try:
+- Say "Hey Jarvis" followed by your request. Each utterance is transcribed locally, and Jarvis only responds when the transcript contains the exact wake phrase. Try:
 - "What's on my calendar today?"
 - "Add a 5 minute scrolling break starting now"
 - "Schedule a 30 minute study session at 3pm called Focus block"
 
-Type `quit` (no talking) to exit.
+Press `Ctrl+C` to exit.
 
 ## Debugging tips
 

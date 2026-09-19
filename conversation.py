@@ -77,7 +77,8 @@ Calendar using the tools you're given.
 
 Today's date and time: {now.strftime("%A, %B %d, %Y, %I:%M %p")}.
 
-Keep spoken replies short and natural, like you're talking, not writing."""
+Keep spoken replies short and natural, like you're talking, not writing.
+Do not use emojis in any response."""
 
 
 def run_turn(user_message, history):
