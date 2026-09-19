@@ -50,7 +50,10 @@ def chat_completion(messages, tools=None, temperature=0.2):
     kwargs = {
         "model": MODEL,
         "messages": messages,
-        "options": {"temperature": temperature, "think": False},
+        "options": {"temperature": temperature},
+        # `think` is a top-level chat() argument, not a model option --
+        # inside `options` it was silently ignored.
+        "think": False,
     }
     if tools:
         kwargs["tools"] = tools

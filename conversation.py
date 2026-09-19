@@ -58,6 +58,10 @@ def extract_event_phrase(user_text, events_context=None):
                     "that isn't grounded in the schedule or the message "
                     "itself. Output ONLY the phrase itself -- no "
                     "commentary, no quotes, no explanation. "
+                    "If the user doesn't specify how long the event lasts, "
+                    "default to a 30 minute duration and state both a start "
+                    "and end time explicitly -- never leave the phrase "
+                    "incomplete or trail off with '...'. "
                     "Example output: 'Break today from 7:15pm to 8pm'"
                     f"{context_block}"
                 ),
