@@ -12,3 +12,4 @@ PyAudio
 numpy
 openwakeword
 onnxruntime
+python-dateutil

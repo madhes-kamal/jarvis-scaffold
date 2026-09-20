@@ -22,6 +22,7 @@ import atexit
 import io
 import os
 import tempfile
+import time
 
 import edge_tts
 import numpy as np
@@ -43,6 +44,15 @@ CHUNK = 1280
 WAKE_MODEL = "hey_jarvis"
 WAKE_THRESHOLD = 0.5
 
+# Recording. A request ends after this many seconds of silence. The library's
+# own default (0.8) ended requests at any thinking pause ("add study blocks
+# for... [pause] my chemistry test").
+PAUSE_SECONDS = 1.5
+# Never treat anything quieter than this as speech, whatever the room measures.
+MIN_ENERGY_THRESHOLD = 120
+# Safety stop if something keeps the recorder open (a fan, a TV).
+PHRASE_LIMIT_SECONDS = 30
+
 # The ONNX backend needs only onnxruntime (the default tflite one doesn't
 # install cleanly on every platform).
 _wake_model = WakeModel(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
@@ -50,6 +60,23 @@ _wake_model = WakeModel(wakeword_models=[WAKE_MODEL], inference_framework="onnx"
 # Skips per-utterance language detection (faster, and stops short clips
 # being misdetected as another language). Set to None to auto-detect.
 WHISPER_LANGUAGE = "en"
+
+# A hint telling Whisper what to expect, so it prefers these words over
+# soundalikes: without it "study blocks" came out as "sturdy blocks" and
+# "chemistry" as "camera". Your event titles are added at run time
+# (set_vocabulary) -- "Code Ninjas", "Business", whatever is on your calendar.
+# Plain words only, no sentences: a sentence-like hint ("Hey Jarvis. Add study
+# blocks...") can leak into the transcript when the audio is unclear.
+BASE_VOCABULARY = "Study blocks, chemistry, calendar, schedule, reschedule, break, bus, school."
+_vocabulary_prompt = BASE_VOCABULARY
+
+
+def set_vocabulary(words):
+    """Add words that matter right now (event titles) to the hint."""
+    global _vocabulary_prompt
+    extra = ", ".join(dict.fromkeys(w.strip() for w in words if w.strip()))[:300]
+    _vocabulary_prompt = f"{BASE_VOCABULARY} {extra}." if extra else BASE_VOCABULARY
+
 
 # Try "en-US-GuyNeural" for American, or run `edge-tts --list-voices` to
 # browse the full catalog and pick whatever sounds most JARVIS to you.
@@ -87,6 +114,14 @@ def _get_source():
         _source = _mic.__enter__()
         atexit.register(_close_mic)
         _recognizer.adjust_for_ambient_noise(_source, duration=1)
+        # By default the library keeps re-adjusting its silence threshold to
+        # 1.5x the loudness of what you are saying WHILE you say it. Speak a
+        # little softer for a few words -- the end of a sentence, say -- and
+        # that stretch counts as silence, so the recording stops mid-request
+        # ("make sturdy blocks for my"). Measured once here, then held fixed.
+        _recognizer.dynamic_energy_threshold = False
+        _recognizer.energy_threshold = max(_recognizer.energy_threshold * 2, MIN_ENERGY_THRESHOLD)
+        _recognizer.pause_threshold = PAUSE_SECONDS
     return _source
 
 
@@ -125,6 +160,7 @@ def _transcribe(audio):
     segments, _ = _whisper_model.transcribe(
         io.BytesIO(audio.get_wav_data()),
         language=WHISPER_LANGUAGE,
+        initial_prompt=_vocabulary_prompt,
         vad_filter=True,
         condition_on_previous_text=False,
     )
@@ -145,7 +181,7 @@ def listen(prompt="Listening... (speak now)", show_status=True, timeout=None):
     if show_status:
         print(prompt)
     try:
-        audio = _recognizer.listen(source, timeout=timeout)
+        audio = _recognizer.listen(source, timeout=timeout, phrase_time_limit=PHRASE_LIMIT_SECONDS)
     except sr.WaitTimeoutError:
         return ""
 
@@ -171,4 +207,5 @@ def speak(text):
     """Speak text out loud. Requires internet (edge-tts is a cloud voice)."""
     print(f"Jarvis: {text}")
     asyncio.run(_speak_async(text))
+    time.sleep(0.3)  # let the speakers' tail die away before listening again
     _flush_input()

@@ -218,3 +218,46 @@ def time_reply(ref):
 
 def date_reply(ref):
     return f"Today is {ref:%A}, {ref:%B} {ref.day}."
+
+
+def join_words(items):
+    if len(items) <= 2:
+        return " and ".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def days_phrase(dates):
+    """Sorted distinct dates -> "weekdays", "the weekend", "Tuesday and
+    Thursday", "Monday through Friday", "every day"."""
+    weekdays = {d.weekday() for d in dates}
+    if len(dates) == 7:
+        return "every day"
+    if len(dates) == 5 and weekdays == {0, 1, 2, 3, 4}:
+        return "weekdays"
+    if len(dates) == 2 and weekdays == {5, 6}:
+        return "the weekend"
+    runs = []
+    for d in dates:
+        if runs and (d - runs[-1][-1]).days == 1:
+            runs[-1].append(d)
+        else:
+            runs.append([d])
+    return join_words([
+        f"{run[0]:%A} through {run[-1]:%A}" if len(run) >= 3
+        else join_words([f"{d:%A}" for d in run])
+        for run in runs
+    ])
+
+
+def day_label(day, today):
+    """day_phrase without the leading "on": "today", "tomorrow", "Friday",
+    "October 2" -- for "through Friday", "until tomorrow"."""
+    phrase = day_phrase(day, today)
+    return phrase[3:] if phrase.startswith("on ") else phrase
+
+
+def at_minutes(day, minutes):
+    """The moment `minutes` after midnight on `day`, local and timezone-aware."""
+    return datetime.datetime.combine(
+        day, datetime.time(minutes // 60 % 24, minutes % 60)
+    ).astimezone()

@@ -27,13 +27,17 @@ import re
 import traceback
 from collections import namedtuple
 
+from dateutil.rrule import rrulestr
+
 from dateparser.search import search_dates
 
+import heads_up
 import time_utils
 from calendar_service import (
     get_events, event_day, has_not_ended, insert_event, insert_events,
-    delete_event, delete_events, update_event, set_event_color,
-    set_event_colors,
+    insert_recurring_event, get_calendar_timezone, get_group_events,
+    delete_event, delete_events, update_event, update_events,
+    set_event_color, set_event_colors,
 )
 from conversation import extract_event_title
 from llm_client import chat_completion
@@ -158,13 +162,38 @@ _NEGATIVE_WORDS = {
 }
 
 
+# Speech-to-text slips seen in practice: "study blocks" heard as "sturdy blocks"
+# or "study plots". Corrected up front, so titles and matching see real words.
+_STURDY = re.compile(r"\bsturdy(?=\s+(?:blocks?|sessions?|periods?|plots?|time)\b)", re.IGNORECASE)
+_STUDY_PLOTS = re.compile(r"\b(study)\s+plots?\b", re.IGNORECASE)
+
+
+def _fix_speech(text):
+    return _STUDY_PLOTS.sub(r"\1 blocks", _STURDY.sub("study", text))
+
+
 def _words(text):
     # Whisper sometimes emits curly apostrophes ("don’t").
     return re.findall(r"[a-z']+", text.lower().replace("’", "'"))
 
 
+# Questions and requests to look something up: never answers to "which one?"
+_ASKING = re.compile(
+    r"^\W*(?:what|what's|whats|when|which|how|do\s+i|show|list|tell|read|is\s+there|are\s+there)\b",
+    re.IGNORECASE,
+)
+
+# A yes or a no is short. A long sentence that merely contains "don't" or
+# "sure" ("...on the days that I don't have code ninjas", "make sure to...")
+# is a new request, not an answer -- treating it as a "no" threw away a whole
+# request.
+_NEGATIVE_MAX_WORDS = 6
+_ANSWER_MAX_WORDS = 8
+
+
 def _is_negative(text):
-    return any(word in _NEGATIVE_WORDS for word in _words(text))
+    words = _words(text)
+    return len(words) <= _NEGATIVE_MAX_WORDS and any(word in _NEGATIVE_WORDS for word in words)
 
 
 def _is_affirmative(text):
@@ -175,6 +204,8 @@ def _is_affirmative(text):
     if _is_negative(text):
         return False
     words = _words(text)
+    if len(words) > _ANSWER_MAX_WORDS:
+        return False
     if any(word in _AFFIRMATIVE_WORDS for word in words):
         return True
     joined = " ".join(words)
@@ -229,6 +260,10 @@ def classify_intent(user_text):
         return "TIME"
     if _FREE_OR_BUSY.search(user_text) or _is_schedule_request(user_text):
         return "READ"
+    if _COLOR_RESET.search(user_text) and re.search(r"colou?r", user_text, re.IGNORECASE):
+        return "COLOR"  # "reset ... to the default color": too easy for the small model to miss
+    if _is_study_request(user_text):
+        return "CREATE"  # "add study blocks for chemistry": not something for the small model to judge
 
     message = chat_completion(
         messages=[
@@ -294,9 +329,10 @@ def classify_intent(user_text):
 # cut. That also keeps "move it to tomorrow at 3pm" from treating "tomorrow"
 # as a description of WHICH event.
 _DESTINATION_SPLIT = re.compile(
-    r"\b(?:to|until|till)\s+(?=(?:around\s+|about\s+|like\s+)?"
+    r"\b(?:to|until|till)\s+(?=(?:(?:start|begin|be)\s+)?(?:at\s+)?(?:around\s+|about\s+|like\s+)?"
     r"(?:\d|noon\b|midnight\b|tomorrow\b|tonight\b|today\b|next\b|"
-    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b))",
+    r"(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b))"
+    r"|\bso\s+(?:that\s+)?(?:they|it)\s+(?:start|begin)s?\s+(?:at\s+)?(?=\d|noon\b|midnight\b)",
     re.IGNORECASE,
 )
 
@@ -361,21 +397,31 @@ def _match_events(user_text, events):
         text_words - generic_words - _COLOR_TOKENS - time_utils.RANGE_WORDS
     )
 
-    by_title = [
-        e for e in candidates
-        if _fuzzy_word_overlap(
-            meaningful_words, set(re.findall(r"[a-z]+", e["summary"].lower()))
+    def _overlaps(event):
+        return _fuzzy_word_overlap(
+            meaningful_words, set(re.findall(r"[a-z]+", event["summary"].lower()))
         )
-    ]
+
+    by_title = [e for e in candidates if _overlaps(e)]
+    source = candidates
+    if not by_title and time_match and meaningful_words:
+        # Nothing at that hour has those words, but other events do: the
+        # hour was probably where they're going ("move the blocks to start
+        # at 4"), not where they are now.
+        by_title = [e for e in events if _overlaps(e)]
+        source = events
     if by_title:
+        # Words that are in no title at all are just talk ("I meant...").
+        pool_words = {w for e in source for w in re.findall(r"[a-z]+", e["summary"].lower())}
+        informative = {w for w in meaningful_words if _fuzzy_word_overlap({w}, pool_words)}
         candidates = by_title
         # "chemistry test" should prefer "Chemistry Test" over "Chemistry
         # Study Block", which shares only one of the two words.
         by_all_words = [
             e for e in by_title
-            if all(
+            if informative and all(
                 _fuzzy_word_overlap({word}, set(re.findall(r"[a-z]+", e["summary"].lower())))
-                for word in meaningful_words
+                for word in informative
             )
         ]
         if by_all_words:
@@ -398,6 +444,45 @@ def _scope_to_days(events, date_range):
     return [e for e in events if first <= event_day(e) <= last]
 
 
+def _latest_group(events):
+    """The events from the most recent Jarvis request among `events` (by when
+    they were created), or None if none of them were made by Jarvis."""
+    tagged = [e for e in events if e.get("group")]
+    if not tagged:
+        return None
+    newest = max(tagged, key=lambda e: e.get("created") or "")
+    return [e for e in tagged if e["group"] == newest["group"]]
+
+
+def _expand_to_group(targets, ref):
+    """If every one of these events came from the same Jarvis request, all of
+    that request's events that are still to come -- not only the few found in
+    the next week. Otherwise the targets themselves."""
+    groups = {e.get("group") for e in targets}
+    if len(groups) != 1 or None in groups:
+        return targets
+    try:
+        found = get_group_events(
+            next(iter(groups)), ref, time_utils.end_of_day(ref.date() + datetime.timedelta(days=366))
+        )
+    except Exception:
+        return targets
+    return found or targets
+
+
+def _says_plural(text, events):
+    """"...the chemistry study BLOCKS": a plural of a word that's in the
+    titles of several of these events ("block") means all of them."""
+    counts = {}
+    for event in events:
+        for word in set(re.findall(r"[a-z]+", event["summary"].lower())):
+            counts[word] = counts.get(word, 0) + 1
+    return any(
+        len(word) >= 4 and word.endswith("s") and word not in counts and counts.get(word[:-1], 0) >= 2
+        for word in re.findall(r"[a-z]+", text.lower())
+    )
+
+
 def _resolve_target(user_text, events, context):
     """Returns ("NONE", None) / ("ONE", event) / ("MANY", [events])."""
     now = time_utils.now()
@@ -407,15 +492,19 @@ def _resolve_target(user_text, events, context):
     candidates = _match_events(user_text, pool)
     unnarrowed = len(candidates) == len(pool)
 
-    # "make them green" / "delete those": the events just added together.
-    batch = context.get("last_batch")
+    # "make them green" / "delete those": the events just added together --
+    # or, after a restart, the most recent request found on the calendar.
+    batch = context.get("last_batch") or _latest_group(events)
     if batch and _BATCH_REF.search(user_text) and (not candidates or unnarrowed):
         return ("MANY", batch) if len(batch) > 1 else ("ONE", batch[0])
+    if _BATCH_REF.search(user_text) and unnarrowed:
+        return "NONE", None  # "them" with nothing it could mean: ask, don't apply it to the whole week
 
     # No day named: an event today is the likelier meaning than a same-named
     # one later in the week, and asking "which one?" every time would be
     # annoying. Later days are only considered when nothing today matches.
-    if not named:
+    wants_all = bool(_WANTS_ALL.search(user_text)) or _says_plural(user_text, candidates)
+    if not named and not wants_all:
         # Something already over is a worse guess than something still ahead.
         ahead = [e for e in candidates if has_not_ended(e, now)]
         if ahead:
@@ -856,57 +945,163 @@ _UNTIL = re.compile(
     re.IGNORECASE,
 )
 
-Repeat = namedtuple("Repeat", "weekdays first last text")
+# A request for study time. "sturdy", "plots" and "periods" are what
+# speech-to-text made of "study" and "blocks" in practice.
+_STUDY_REQUEST = re.compile(
+    r"\b(?:study|sturdy|studying)\s+(?:blocks?|sessions?|periods?|plots?|time)\b", re.IGNORECASE
+)
+_STUDY_PLURAL = re.compile(
+    r"\b(?:study|sturdy|studying)\s+(?:blocks|sessions|periods|plots)\b", re.IGNORECASE
+)
+# Not a request to MAKE study blocks, even with those words in it.
+_NOT_A_STUDY_REQUEST = re.compile(
+    r"\b(?:delete|cancel|remove|move|reschedule|change|update|colou?r)\b"
+    r"|^\W*(?:what|when|which|how|do\s+i|did\s+i|show|list|tell|read|is\s+there|are\s+there)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_study_request(text):
+    """Asking for study time to be added. Not when the same words are being
+    recolored ("make my study blocks red"), moved, deleted or asked about."""
+    return (
+        bool(_STUDY_REQUEST.search(text))
+        and not _NOT_A_STUDY_REQUEST.search(text)
+        and _extract_color(text) is None
+    )
+
+
+# Days to leave out of a repeat: "...on the days I don't have code ninjas",
+# "except tuesday and thursday", "skip weekends", "except code ninjas days".
+_EXCLUDE_EVENT_DAYS = re.compile(
+    r"\b(?:on|to|for)\s+(?:only\s+)?(?:the\s+)?days\s+(?:that\s+|when\s+|where\s+)?(?:i|we)\s+"
+    r"(?:don'?t|do\s+not|won'?t)\s+have\s+(?P<name>[a-z][a-z' -]*?)"
+    r"(?=\s+(?:at|from|for|every|until|through|this|next|after|before|on)\b|[,.?!]|$)",
+    re.IGNORECASE,
+)
+_EXCLUDE_NAMED_DAYS = re.compile(
+    rf"\b(?:except|excluding|skip|skipping|not\s+on|other\s+than)\s+(?:the\s+)?"
+    rf"(?P<days>(?:(?:{_DAY_NAMES})s?(?:\s*,\s*(?:and\s+)?|\s+and\s+|\s+)?)+|weekends?|weekdays?)",
+    re.IGNORECASE,
+)
+_EXCLUDE_EVENT_NAMED = re.compile(
+    r"\b(?:except|excluding|skip|skipping|not\s+on|other\s+than)\s+(?:the\s+)?"
+    r"(?P<name>[a-z][a-z' -]*?)\s+days\b",
+    re.IGNORECASE,
+)
 
 
 def _cut(text, match):
     return text[: match.start()] + " " + text[match.end():]
 
 
+def _parse_exclusion(text):
+    """Days the message says to leave out. Returns (weekdays to skip, title
+    words of events whose days to skip, the message without that phrase)."""
+    text = text.replace("’", "'")  # Whisper's curly apostrophe
+    weekdays, terms = set(), set()
+    if found := _EXCLUDE_EVENT_DAYS.search(text):
+        terms = set(re.findall(r"[a-z]+", found["name"].lower())) - _SEARCH_STOPWORDS
+        text = _cut(text, found)
+    elif found := _EXCLUDE_NAMED_DAYS.search(text):
+        names = found["days"].lower()
+        if names.startswith("weekend"):
+            weekdays = {5, 6}
+        elif names.startswith("weekday"):
+            weekdays = {0, 1, 2, 3, 4}
+        else:
+            weekdays = {time_utils.WEEKDAYS.index(n) for n in re.findall(_DAY_NAMES, names)}
+        text = _cut(text, found)
+    elif found := _EXCLUDE_EVENT_NAMED.search(text):
+        terms = set(re.findall(r"[a-z]+", found["name"].lower())) - _SEARCH_STOPWORDS
+        text = _cut(text, found)
+    return weekdays, terms, text
+
+
+def _apply_exclusions(dates, exclude):
+    """Drop the excluded weekdays, and any day that has an event matching the
+    excluded title ("code ninjas")."""
+    weekdays, terms = exclude
+    dates = [d for d in dates if d.weekday() not in weekdays]
+    if terms and dates:
+        events = get_events(time_utils.start_of_day(dates[0]), time_utils.end_of_day(dates[-1]))
+        blocked = {event_day(e) for e in events if _matches_terms(e, terms)}
+        dates = [d for d in dates if d not in blocked]
+    return dates
+
+
+Repeat = namedtuple("Repeat", "weekdays first last text explicit_end explicit_repeat exclude")
+
+
 def _parse_repeat(text, ref):
     """Does the message ask for something on a repeating basis? Returns a
     Repeat -- the weekdays it falls on (0=Monday), the first and last date
-    it covers, and the message with the repeat words cut out -- or None.
+    it covers, the message with the repeat words cut out, whether it said
+    where it ends and whether it said "every", and any days to leave out --
+    or None.
 
     The dates are all worked out here: "every day for 2 weeks", "every
-    tuesday and thursday until friday", "on weekdays next week"."""
-    weekly = False
-    if match := _EVERY_DAY.search(text):
-        weekdays = set(range(7))
-    elif match := _EVERY_WEEKDAY.search(text):
-        weekdays = {0, 1, 2, 3, 4}
-    elif match := _EVERY_WEEKEND.search(text):
-        weekdays = {5, 6}
-    elif (match := _EVERY_NAMED.search(text)) or (match := _PLURAL_NAMED.search(text)):
-        weekdays = {
-            time_utils.WEEKDAYS.index(name)
-            for name in re.findall(_DAY_NAMES, match["days"].lower())
-        }
-    elif match := _WEEKLY.search(text):
-        weekdays, weekly = set(), True
-    else:
-        return None
-    text = _cut(text, match)
+    tuesday and thursday until friday", "on weekdays next week". Without the
+    word "every", a stretch of time ("until friday", "for 5 days"), days to
+    skip, or plural study blocks ("study blocks for chemistry") still means
+    several."""
+    skip_weekdays, skip_terms, text = _parse_exclusion(text)
 
-    span_days = None
-    if match := _FOR_SPAN.search(text):
-        n = int(match["n"]) if match["n"].isdigit() else _WORD_AMOUNTS[match["n"].lower()]
-        span_days = int(n * {"d": 1, "w": 7, "m": 30}[match["unit"][0].lower()])
+    match, weekdays, weekly = None, None, False
+    for pattern, days in (
+        (_EVERY_DAY, set(range(7))),
+        (_EVERY_WEEKDAY, {0, 1, 2, 3, 4}),
+        (_EVERY_WEEKEND, {5, 6}),
+    ):
+        if found := pattern.search(text):
+            match, weekdays = found, set(days)
+            break
+    else:
+        if found := (_EVERY_NAMED.search(text) or _PLURAL_NAMED.search(text)):
+            match = found
+            weekdays = {
+                time_utils.WEEKDAYS.index(name)
+                for name in re.findall(_DAY_NAMES, found["days"].lower())
+            }
+        elif found := _WEEKLY.search(text):
+            match, weekdays, weekly = found, set(), True
+    if match:
         text = _cut(text, match)
 
+    span_days = None
+    if found := _FOR_SPAN.search(text):
+        n = int(found["n"]) if found["n"].isdigit() else _WORD_AMOUNTS[found["n"].lower()]
+        span_days = int(n * {"d": 1, "w": 7, "m": 30}[found["unit"][0].lower()])
+        text = _cut(text, found)
+
     until = None
-    if match := _UNTIL.search(text):
-        found = time_utils.parse_date_range(match["when"], ref)
-        if found and found.start.date() == found.end.date():
-            until = found.end.date()
-            text = _cut(text, match)
+    if found := _UNTIL.search(text):
+        parsed = time_utils.parse_date_range(found["when"], ref)
+        if parsed and parsed.start.date() == parsed.end.date():
+            until = parsed.end.date()
+            text = _cut(text, found)
 
     today = ref.date()
     first, last = today, None
-    if named := time_utils.parse_date_range(text, ref):
+    named = time_utils.parse_date_range(text, ref)
+    window = bool(named and named.start.date() != named.end.date())
+    if named:
         first = max(named.start.date(), today)
-        if named.start.date() != named.end.date():
+        if window:
             last = named.end.date()  # "every day next week"
+
+    if match is None:
+        # Plural study blocks on one named day ("study blocks tomorrow at 5")
+        # are still just that day.
+        several = (
+            span_days or until or skip_weekdays or skip_terms
+            or (_STUDY_PLURAL.search(text) and (named is None or window))
+        )
+        if not several:
+            return None
+        weekdays = set(range(7))
+
+    explicit_end = bool(until or span_days or window)
     if until and until >= first:
         last = until
     elif span_days:
@@ -916,7 +1111,10 @@ def _parse_repeat(text, ref):
     last = min(last, first + datetime.timedelta(days=MAX_REPEAT_DAYS - 1))
     if weekly:
         weekdays = {first.weekday()}
-    return Repeat(weekdays, first, last, text)
+    return Repeat(
+        weekdays, first, last, text, explicit_end, match is not None,
+        (skip_weekdays, skip_terms),
+    )
 
 
 def _weekday_label(weekdays):
@@ -926,7 +1124,20 @@ def _weekday_label(weekdays):
         return "on weekdays"
     if weekdays == {5, 6}:
         return "on weekends"
-    return "every " + _join_words([time_utils.WEEKDAYS[i].capitalize() for i in sorted(weekdays)])
+    days = sorted(weekdays)
+    if len(days) >= 3 and days == list(range(days[0], days[-1] + 1)):
+        return f"on {time_utils.WEEKDAYS[days[0]].capitalize()} to {time_utils.WEEKDAYS[days[-1]].capitalize()}"
+    return "every " + _join_words([time_utils.WEEKDAYS[i].capitalize() for i in days])
+
+
+def _count_overlapping(occurrences):
+    """How many of the (start, end) pairs land on top of an existing timed event."""
+    busy = [
+        (datetime.datetime.fromisoformat(e["start_iso"]), datetime.datetime.fromisoformat(e["end_iso"]))
+        for e in get_events(occurrences[0][0], occurrences[-1][1])
+        if e["start"] != "All day"
+    ]
+    return sum(1 for start, end in occurrences if any(b0 < end and b1 > start for b0, b1 in busy))
 
 
 def _create_repeating(repeat, ref, context):
@@ -934,7 +1145,10 @@ def _create_repeating(repeat, ref, context):
     a lot of events to add on the strength of one transcript, and a
     misheard word would otherwise mean cleaning them all up by hand.
 
-    Either every day at the same time ("every day at 6.30 pm"), or tied to
+    Study blocks for a subject with a test coming up go through the
+    conflict-aware plan (and stop the day before the test); study blocks over
+    a stretch of days with no test do the same over those days. Otherwise it
+    is either every day at the same time ("every day at 6.30 pm"), or tied to
     another event whose time differs from day to day ("after school every
     day"), in which case only days that have that event get one."""
     text = repeat.text
@@ -943,28 +1157,51 @@ def _create_repeating(repeat, ref, context):
         for i in range((repeat.last - repeat.first).days + 1)
         if (repeat.first + datetime.timedelta(days=i)).weekday() in repeat.weekdays
     ]
+    dates = _apply_exclusions(dates, repeat.exclude)
 
-    anchor_name = None
-    occurrences = []
     relative = _RELATIVE.search(text)
     terms = _anchor_terms(relative) if relative else None
+    title_text = _cut(text, relative) if terms else text  # what's left describes the event
+
+    study = bool(_STUDY_REQUEST.search(title_text))
+    test = _test_for(title_text, ref) if study else None  # this subject's next test
+    if test:
+        dates = [d for d in dates if d < event_day(test.event)]  # studying stops at the test
+    if not dates:
+        if test:
+            return f"There are no days left before your {test.event['summary']}.", context
+        return "None of those days work, so I didn't add anything.", context
+
+    if study and not terms:
+        minutes = _answer_time(title_text)
+        if test:
+            events = get_events(ref, time_utils.end_of_day(dates[-1]))
+            return _study_offer_for(test, events, minutes, ref, context, days=dates)
+        if not repeat.explicit_repeat and (repeat.explicit_end or any(repeat.exclude)):
+            if not repeat.explicit_end:  # no stretch named: a week's worth
+                dates = [d for d in dates if d <= repeat.first + datetime.timedelta(days=6)]
+            return _offer_study_days(title_text, dates, minutes, ref, context)
+
+    anchor_name = None
     if terms:
-        first = ref if repeat.first == ref.date() else time_utils.start_of_day(repeat.first)
+        first = ref if dates[0] == ref.date() else time_utils.start_of_day(dates[0])
         by_day = {}
-        for event in _events_matching(terms, first, time_utils.end_of_day(repeat.last)):
+        for event in _events_matching(terms, first, time_utils.end_of_day(dates[-1])):
             by_day.setdefault(event_day(event), event)
         occurrences = [_relative_times(relative, by_day[d], text) for d in dates if d in by_day]
         if not occurrences:
             return (
                 f"I couldn't find {relative['name'].strip()} on your calendar "
-                f"between {repeat.first:%B} {repeat.first.day} and "
-                f"{repeat.last:%B} {repeat.last.day}."
+                f"between {dates[0]:%B} {dates[0].day} and {dates[-1]:%B} {dates[-1].day}."
             ), context
         anchor_name = next(iter(by_day.values()))["summary"]
-        text = _cut(text, relative)
     else:
         parsed = _parse_new_event(text, ref)
         if not parsed:
+            # Without an explicit "every day" it's a plan request, whatever
+            # the subject (a misheard one gets the "which test?" list).
+            if study and (not repeat.explicit_repeat or not _subject_terms(title_text)):
+                return _offer_study_plan(title_text, ref, context)
             return (
                 "What time should they be? Try something like 'every day at "
                 "6.30 pm', or 'every day after school'."
@@ -981,8 +1218,13 @@ def _create_repeating(repeat, ref, context):
     if not occurrences:
         return "Every one of those would already be over, so I didn't add anything.", context
 
-    title = extract_event_title(text) or _fallback_title(text)
-    title = title[:1].upper() + title[1:]
+    if test:
+        # Named after the test's own subject, not after whatever
+        # speech-to-text heard.
+        title = f"{test.subject[:1].upper()}{test.subject[1:]} study block"
+    else:
+        title = extract_event_title(title_text) or _fallback_title(title_text)
+        title = title[:1].upper() + title[1:]
     if anchor_name:
         label = _weekday_label({start.weekday() for start, _ in occurrences})
         what = f"right after {anchor_name}" if relative["rel"].lower() == "after" else f"right before {anchor_name}"
@@ -991,6 +1233,8 @@ def _create_repeating(repeat, ref, context):
         what = f"at {occurrences[0][0]:%I:%M %p}"
     last_day = occurrences[-1][0].date()
     spoken = f"{title} {what} {label}, through {last_day:%B} {last_day.day}"
+    if test:
+        spoken += f", ahead of your {test.event['summary']}"
     print(f"  [repeat: {title!r}, {len(occurrences)} events, {occurrences[0][0]:%a %b %d} to {last_day:%a %b %d}]")
 
     context["confirm_pending"] = {
@@ -999,22 +1243,355 @@ def _create_repeating(repeat, ref, context):
         "spoken": spoken,
         "occurrences": [(s.isoformat(), e.isoformat()) for s, e in occurrences],
     }
-    return f"Add {spoken}? That's {len(occurrences)} events.", context
+    text = f"Add {spoken}? That's {len(occurrences)} events."
+    overlapping = _count_overlapping(occurrences)
+    if overlapping:
+        text += f" {overlapping} of them overlap something already on your calendar."
+    return text, context
+
+
+_RRULE_DAYS = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
+
+
+def _recurrence_for(occurrences):
+    """If these (start, end) ISO pairs are one time of day on a regular
+    pattern of weekdays with no gaps -- "every day", "Monday, Wednesday and
+    Friday" -- the ONE repeating event that describes them:
+    (RRULE line, first start, first end). Otherwise None: a day was moved or
+    skipped, or the days are irregular, and a repeating event can't say
+    that, so separate events are made instead.
+
+    The rule is expanded again here and must give back exactly the same days
+    before it is trusted."""
+    if len(occurrences) < 2:
+        return None
+    starts = [datetime.datetime.fromisoformat(s) for s, _ in occurrences]
+    ends = [datetime.datetime.fromisoformat(e) for _, e in occurrences]
+    if len({(s.hour, s.minute) for s in starts}) != 1 or len({e - s for s, e in zip(starts, ends)}) != 1:
+        return None
+    dates = [s.date() for s in starts]
+    weekdays = {d.weekday() for d in dates}
+    every_such_day = [
+        dates[0] + datetime.timedelta(days=n)
+        for n in range((dates[-1] - dates[0]).days + 1)
+        if (dates[0] + datetime.timedelta(days=n)).weekday() in weekdays
+    ]
+    if dates != every_such_day:
+        return None
+    if len(weekdays) == 7:
+        rule = f"RRULE:FREQ=DAILY;COUNT={len(dates)}"
+    else:
+        byday = ",".join(_RRULE_DAYS[i] for i in sorted(weekdays))
+        rule = f"RRULE:FREQ=WEEKLY;BYDAY={byday};COUNT={len(dates)}"
+    if [d.date() for d in rrulestr(rule[len("RRULE:"):], dtstart=starts[0])] != dates:
+        return None
+    return rule, occurrences[0][0], occurrences[0][1]
+
+
+def _create_events(title, occurrences):
+    """Create the events for a plan. A regular pattern becomes ONE repeating
+    event (one thing to recolor, move or delete in Google Calendar); anything
+    else -- or if the calendar's time zone can't be read, or Google refuses --
+    becomes separate events, tagged as one group. Returns (created events,
+    error, whether it's one repeating event)."""
+    recurrence = _recurrence_for(occurrences)
+    if recurrence:
+        zone = get_calendar_timezone()
+        if zone:
+            rule, start, end = recurrence
+            try:
+                return [insert_recurring_event(title, start, end, rule, zone)], None, True
+            except Exception:
+                traceback.print_exc()  # fall back to separate events below
+    created, error = insert_events([(title, s, e) for s, e in occurrences])
+    return created, error, False
 
 
 def _do_create_many(pending, context):
-    items = [(pending["title"], s, e) for s, e in pending["occurrences"]]
-    created, error = insert_events(items)
+    created, error, as_series = _create_events(pending["title"], pending["occurrences"])
+    n = len(pending["occurrences"])
     if created:
         context["last_event"] = created[-1]
         context["last_batch"] = created  # so "make them green" means these
     if error:
         traceback.print_exception(error)
         return (
-            f"I added {len(created)} of {len(items)} {pending['title']} events, "
+            f"I added {len(created)} of {n} {pending['title']} events, "
             "then something went wrong with the calendar."
         ), context
-    return f"Added {pending['spoken']}: {len(items)} events.", context
+    how = ", as one repeating event" if as_series else ""
+    return f"Added {pending['spoken']}: {n} events{how}.", context
+
+
+# --- "add study blocks for my chemistry test": find the test, then offer
+
+# Words in a study request that aren't the subject.
+_STUDY_NOISE = {
+    "study", "studying", "sturdy", "block", "blocks", "session", "sessions",
+    "period", "periods", "plot", "plots", "time", "plan", "some", "pm", "am",
+    "per", "every", "each", "daily", "after", "before",
+}
+
+
+def _subject_terms(text):
+    """What's left of a study request once the command, time and filler words
+    are removed: ideally just the subject ("chemistry")."""
+    words = set(re.findall(r"[a-z]+", time_utils.strip_date_expressions(text.lower())))
+    return (
+        words - _TITLE_DROP - _SEARCH_STOPWORDS - time_utils.RANGE_WORDS
+        - heads_up.TRIGGER_WORDS - _STUDY_NOISE
+    )
+
+
+def _subject_matches(subject, terms):
+    words = subject.split()
+    return all(
+        any(w == t or (min(len(w), len(t)) >= 4 and (w.startswith(t) or t.startswith(w))) for w in words)
+        for t in terms
+    )
+
+
+def _tests_ahead(ref):
+    """(all events in the look-ahead window, the tests/quizzes/deadlines in
+    them that have a subject)."""
+    last_day = ref.date() + datetime.timedelta(days=heads_up.HEADS_UP_DAYS - 1)
+    events = get_events(ref, time_utils.end_of_day(last_day))
+    return events, [i for i in heads_up.find_heads_up(events, ref) if i.subject]
+
+
+def _test_for(text, ref):
+    """The nearest upcoming test for the subject named in `text`, or None."""
+    terms = _subject_terms(text)
+    if not terms:
+        return None
+    _, items = _tests_ahead(ref)
+    return next((i for i in items if _subject_matches(i.subject, terms)), None)
+
+
+def _subject_phrase(text):
+    """The subject named in a study request, in the order it was said:
+    "add chemistry study blocks" -> "chemistry"."""
+    terms = _subject_terms(text)
+    return " ".join(w for w in re.findall(r"[a-z]+", text.lower()) if w in terms)
+
+
+def _no_room_reply(subject, minutes, where, context, plan_state):
+    """Nothing fits at that time: ask for another (the plan is remembered)."""
+    context["confirm_pending"] = {**plan_state, "stage": "ask_time", "minutes": minutes, "occurrences": []}
+    kind = f"{subject} study blocks" if subject else "study blocks"
+    return f"There's no room for {kind} at {heads_up.clock_text(minutes)} {where}. What time works?", context
+
+
+def _study_offer_for(item, events, minutes, ref, context, days=None):
+    """Offer study blocks for one test, at `minutes` (default 6:30 PM), on
+    `days` (default: every day from today to the day before it)."""
+    minutes = minutes if minutes is not None else heads_up.DEFAULT_STUDY_MINUTES
+    days = days if days is not None else heads_up.days_before(item.event, ref)
+    offer = heads_up.offer_for(item, events, ref, minutes, days=days)
+    if offer is None:
+        state = {
+            "intent": "STUDY_PLAN", "subject": item.subject, "test": item.event,
+            "days": [d.isoformat() for d in days],
+        }
+        return _no_room_reply(item.subject, minutes, f"before your {item.event['summary']}", context, state)
+    text, pending = offer
+    if item.prep_count:
+        plural = "block" if item.prep_count == 1 else "blocks"
+        text = f"You already have {item.prep_count} {item.subject} study {plural} before it. {text}"
+    context["confirm_pending"] = pending
+    return text, context
+
+
+def _offer_study_days(text, days, minutes, ref, context):
+    """Study blocks on the days asked for, with no test behind them ("add
+    chemistry study blocks this week to the days I don't have code ninjas"):
+    the same conflict-aware offer, at 6:30 PM unless a time was named."""
+    subject = _subject_phrase(text)
+    minutes = minutes if minutes is not None else heads_up.DEFAULT_STUDY_MINUTES
+    events = get_events(ref, time_utils.end_of_day(days[-1]))
+    offer = heads_up.offer_for_days(subject, days, events, ref, minutes)
+    if offer is None:
+        state = {
+            "intent": "STUDY_PLAN", "subject": subject, "test": None,
+            "days": [d.isoformat() for d in days],
+        }
+        return _no_room_reply(subject, minutes, "on those days", context, state)
+    context["confirm_pending"] = offer[1]
+    return offer[0], context
+
+
+def _offer_study_plan(text, ref, context):
+    """A study request with no time in it: "add study blocks for my chemistry
+    test". Finds the test on the calendar and offers blocks, exactly as the
+    morning brief does -- 6:30 PM unless the message names a time, moved off
+    anything already on the calendar."""
+    terms = _subject_terms(text)
+    events, items = _tests_ahead(ref)
+    matches = [i for i in items if _subject_matches(i.subject, terms)] if terms else items
+
+    if not matches or (not terms and len(matches) > 1):
+        if not items:
+            return (
+                "I don't see a test, exam or quiz coming up in the next two "
+                "weeks, so I don't know when to stop. Try 'add chemistry "
+                "study blocks every day at 6.30 until Friday'."
+            ), context
+        # Nothing matched the subject -- often speech-to-text ("camera" for
+        # "chemistry") -- or none was named and there are several tests.
+        # Guessing wrong would plan for the wrong test, so let the user pick.
+        choices = items[:3]
+        today = ref.date()
+        context["confirm_pending"] = {
+            "intent": "STUDY_PLAN", "stage": "pick_test", "minutes": _answer_time(text),
+            "choices": [i.event for i in choices],
+        }
+        if terms and len(choices) == 1:
+            only = choices[0].event
+            return (
+                f"I don't see a {_subject_phrase(text)} test coming up, but I do "
+                f"see {only['summary']} {_when(only, today)}. Want study blocks for that one?"
+            ), context
+        names = _join_words([f"{i.event['summary']} {_when(i.event, today)}" for i in choices])
+        return f"I couldn't tell which test that's for. I see {names}. Which one?", context
+
+    return _study_offer_for(matches[0], events, _answer_time(text), ref, context)
+
+
+# --- answering the morning offer of study blocks (see heads_up.py)
+
+# Saying no to the whole idea, as opposed to a plain "no" (wrong time).
+_DECLINES = re.compile(
+    r"\b(?:no\s+thanks|no\s+thank\s+you|not\s+now|not\s+today|never\s*mind|skip\s+it|"
+    r"forget\s+it|leave\s+it|i'?m\s+good|maybe\s+later|don'?t\s+bother)\b",
+    re.IGNORECASE,
+)
+# A time given as the whole answer: "7", "7:30", "how about 8", "make it 4 pm".
+_BARE_TIME = re.compile(
+    r"^\W*(?:(?:how|what)\s+about|make\s+it|let'?s\s+say|say|try|maybe|at|around|about)?\s*"
+    r"(\d{1,2})(?:[:.](\d{2}))?\s*(?:o'?clock)?\s*(am|pm)?\W*$",
+    re.IGNORECASE,
+)
+
+
+def _answer_time(text):
+    """A time of day given as an answer -- "3:30 pm", "at 7", "how about 8",
+    "noon" -- as minutes after midnight, or None. Study happens in the
+    afternoon and evening, so a bare hour is a PM one: "7" is 7 PM."""
+    cleaned = _normalize_spoken_digits(_normalize_meridian(text.lower()))
+    times = _spoken_times(cleaned)
+    if times:
+        hour, minute, meridian, _ = times[0]
+    elif match := _BARE_TIME.match(cleaned):
+        hour, minute, meridian = int(match[1]), int(match[2] or 0), (match[3] or "").lower() or None
+        if hour > 23 or minute > 59 or (meridian and not 1 <= hour <= 12):
+            return None
+        if meridian is None and (hour > 12 or hour == 0):
+            meridian = "24"
+    else:
+        return None
+    if meridian in ("am", "pm", "24"):
+        return _minutes_of_day(hour, minute, meridian)
+    return (hour if hour >= 12 else hour + 12) * 60 + minute
+
+
+def _handle_study_plan(plan, text, context):
+    """The user's reply to "Want me to add chemistry study blocks at 6:30
+    PM...?". A yes creates them. A time ("3:30 pm") makes a new plan at that
+    time, which moves blocks off anything already on the calendar and says
+    so. A plain no asks what time would work. "No thanks" drops it. Anything
+    else isn't an answer, so returns None and is treated as a new request."""
+    ref = time_utils.now()
+
+    if len(_words(text)) > _ANSWER_MAX_WORDS:
+        return None  # too long to be an answer: a new request
+
+    if _DECLINES.search(text):
+        return "Okay, I won't add any study blocks.", context
+
+    if plan["stage"] == "pick_test":
+        # "Which one?" -- the answer names the subject ("chemistry"), or is a
+        # yes when only one test was on offer.
+        if _is_negative(text):
+            return "Okay, I won't add any study blocks.", context
+        terms = _subject_terms(text)
+        picked = [
+            e for e in plan["choices"]
+            if terms and _subject_matches(heads_up.subject_of(e["summary"]), terms)
+        ]
+        if not picked and len(plan["choices"]) == 1 and _is_affirmative(text):
+            picked = plan["choices"]
+        if not picked:
+            return None
+        events, items = _tests_ahead(ref)
+        item = next((i for i in items if i.event["id"] == picked[0]["id"]), None)
+        if item is None:
+            return None
+        return _study_offer_for(item, events, plan.get("minutes"), ref, context)
+
+    subject = plan["subject"]
+
+    minutes = _answer_time(text)
+    if minutes is not None:
+        return _propose_study_plan(plan, minutes, ref, context)
+
+    if _is_affirmative(text):
+        if plan["stage"] == "ask_time":
+            context["confirm_pending"] = plan
+            the = f"the {subject} study blocks" if subject else "the study blocks"
+            return f"What time should {the} be?", context
+        return _create_study_blocks(plan, context)
+
+    if _is_negative(text):
+        if plan["stage"] == "ask_time":
+            return "Okay, I won't add any study blocks.", context
+        context["confirm_pending"] = {**plan, "stage": "ask_time"}
+        return f"What time works for {subject or 'them'}?", context
+    return None
+
+
+def _propose_study_plan(plan, minutes, ref, context):
+    days = [datetime.date.fromisoformat(d) for d in plan["days"]]
+    events = get_events(ref, time_utils.end_of_day(days[-1]))
+    limit = heads_up.MAX_STUDY_BLOCKS if plan.get("test") else None
+    result = heads_up.plan_study_days(days, events, ref, minutes, limit=limit)
+    if not result.occurrences:
+        context["confirm_pending"] = {**plan, "stage": "ask_time"}
+        clock = heads_up.clock_text(minutes)
+        # When today is the only day left, "no room" is usually "already past".
+        if days == [ref.date()] and time_utils.at_minutes(ref.date(), minutes) < ref:
+            return f"{clock} has already passed today. What time later today works?", context
+        where = "before it" if plan.get("test") else "on those days"
+        return f"There's no free room at {clock} {where}. What other time works?", context
+    context["confirm_pending"] = {
+        **plan,
+        "stage": "offer",
+        "minutes": minutes,
+        "occurrences": [(s.isoformat(), e.isoformat()) for s, e in result.occurrences],
+    }
+    return heads_up.describe_plan(plan["subject"], result, minutes, ref.date()), context
+
+
+def _create_study_blocks(plan, context):
+    subject = plan["subject"]
+    title = f"{subject[:1].upper()}{subject[1:]} study block" if subject else "Study block"
+    kind = f"{subject} study blocks" if subject else "study blocks"
+    occurrences = plan["occurrences"]
+    created, error, as_series = _create_events(title, occurrences)
+    if created:
+        context["last_event"] = created[-1]
+        context["last_batch"] = created
+    if error:
+        traceback.print_exception(error)
+        return (
+            f"I added {len(created)} of {len(occurrences)} {kind}, "
+            "then something went wrong with the calendar."
+        ), context
+    today = time_utils.now().date()
+    last = datetime.datetime.fromisoformat(occurrences[-1][1]).date()
+    if len(occurrences) == 1:
+        return f"Added a {subject + ' ' if subject else ''}study block {time_utils.day_phrase(last, today)}.", context
+    how = ", as one repeating event" if as_series else ""
+    return f"Added {len(occurrences)} {kind}, through {time_utils.day_label(last, today)}{how}.", context
 
 
 def _when(event, today):
@@ -1030,6 +1607,8 @@ def _do_delete(target, context):
     delete_event(target["id"])
     context["last_event"] = None
     context["pending"] = None
+    if target.get("is_series"):
+        return f"Deleted the whole repeating {target['summary']}.", context
     return f"Deleted {target['summary']} {_when(target, today)}.", context
 
 
@@ -1059,7 +1638,7 @@ _SEARCH_STOPWORDS = {
     "check", "see", "hey", "jarvis", "later", "left", "rest", "else", "other",
     "all", "everything", "much", "full", "packed", "now", "still", "just",
     "so", "okay", "ok", "um", "uh", "it", "that", "this", "we", "will", "would",
-    "about", "appointment", "appointments", "time", "start", "starts",
+    "about", "appointment", "appointments", "per", "time", "start", "starts",
     "begin", "begins", "end", "ends", "long", "yes", "yeah", "yep", "sure",
     "thanks", "thank", "right", "well", "actually", "then", "next", "if",
     "whether", "want", "need", "know", "let", "also", "too", "again",
@@ -1111,33 +1690,8 @@ def _event_line(event):
 MIN_REPEATS = 3
 
 
-def _join_words(items):
-    if len(items) <= 2:
-        return " and ".join(items)
-    return ", ".join(items[:-1]) + " and " + items[-1]
-
-
-def _days_phrase(dates):
-    """Sorted distinct dates -> "weekdays", "the weekend", "Tuesday and
-    Thursday", "Monday through Friday", "every day"."""
-    weekdays = {d.weekday() for d in dates}
-    if len(dates) == 7:
-        return "every day"
-    if len(dates) == 5 and weekdays == {0, 1, 2, 3, 4}:
-        return "weekdays"
-    if len(dates) == 2 and weekdays == {5, 6}:
-        return "the weekend"
-    runs = []
-    for d in dates:
-        if runs and (d - runs[-1][-1]).days == 1:
-            runs[-1].append(d)
-        else:
-            runs.append([d])
-    return _join_words([
-        f"{run[0]:%A} through {run[-1]:%A}" if len(run) >= 3
-        else _join_words([f"{d:%A}" for d in run])
-        for run in runs
-    ])
+_join_words = time_utils.join_words
+_days_phrase = time_utils.days_phrase
 
 
 def _routine_sentence(title, occurrences):
@@ -1303,6 +1857,8 @@ _WANTS_ALL = re.compile(r"\b(?:all|every|each|both|everything)\b|\b(?:those|thes
 def _titles_phrase(targets):
     """"all 5 Chemistry study block events", or with mixed titles "all 6
     events (5 Chemistry study block, 1 Chemistry test)"."""
+    if len(targets) == 1:
+        return targets[0]["summary"]
     counts = {}
     for event in targets:
         counts[event["summary"]] = counts.get(event["summary"], 0) + 1
@@ -1312,12 +1868,92 @@ def _titles_phrase(targets):
     return f"all {len(targets)} events ({breakdown})"
 
 
+def _prepare_bulk_move(targets, text, context):
+    """Change the START TIME of several events at once ("move all the
+    chemistry study blocks to start at 4"). Each keeps its own day and its
+    length; only the time of day changes. Asks first, and says how many of
+    them would land on something already on the calendar. A repeating event
+    is moved through its individual occurrences."""
+    now = time_utils.now()
+    movable = []
+    for event in targets:
+        if event.get("is_series"):
+            movable += [e for e in _expand_to_group([event], now) if not e.get("is_series")]
+        elif event["start"] != "All day":
+            movable.append(event)
+    if not movable:
+        return (
+            "I couldn't find individual events to move there (all-day or "
+            "repeating). Change it in Google Calendar, or name one day's."
+        ), context
+
+    _, destination = _split_target_and_destination(text)
+    if _DAY_WORDS.search(destination):
+        return (
+            "I can change the time of several events at once, but not move "
+            "them to a different day."
+        ), context
+    clock = _parse_clock_time(_normalize_bare_times(_normalize_meridian(destination)))
+    if not clock:
+        return (
+            "I couldn't tell what new time you want -- try something like "
+            "'move them to 4pm'."
+        ), context
+    hour, minute, _ = clock
+
+    items = []
+    for event in movable:
+        start = datetime.datetime.fromisoformat(event["start_iso"])
+        end = datetime.datetime.fromisoformat(event["end_iso"])
+        new_start = start.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if new_start != start:
+            items.append((event, new_start, new_start + (end - start)))
+    if not items:
+        return "They already start then.", context
+
+    moved_ids = {event["id"] for event, _, _ in items}
+    busy = [
+        (datetime.datetime.fromisoformat(b["start_iso"]), datetime.datetime.fromisoformat(b["end_iso"]))
+        for b in get_events(min(s for _, s, _ in items), max(e for _, _, e in items))
+        if b["start"] != "All day" and b["id"] not in moved_ids
+    ]
+    overlapping = sum(1 for _, s, e in items if any(b0 < e and b1 > s for b0, b1 in busy))
+
+    spoken = f"{_titles_phrase([event for event, _, _ in items])} to {items[0][1]:%I:%M %p}"
+    context["confirm_pending"] = {
+        "intent": "UPDATE_MANY",
+        "items": [(event["id"], s.isoformat(), e.isoformat()) for event, s, e in items],
+        "spoken": spoken,
+    }
+    text = f"Move {spoken}?"
+    if overlapping:
+        text += f" {overlapping} of them would overlap something already on your calendar."
+    return text, context
+
+
+def _do_update_many(pending, context):
+    done, error = update_events(pending["items"])
+    if error:
+        traceback.print_exception(error)
+        return (
+            f"I moved {done} of {len(pending['items'])} events before something "
+            "went wrong with the calendar."
+        ), context
+    return f"Moved {pending['spoken']}.", context
+
+
 def _apply_to_all(intent, targets, text, context, note=""):
-    """COLOR or DELETE across several events at once ("each of those").
-    Recoloring just happens (it's easy to undo); deleting this many events
-    asks first."""
+    """COLOR, DELETE or a change of start time across several events at once
+    ("each of those"). Recoloring just happens (it's easy to undo); deleting
+    or moving this many events asks first."""
+    if intent == "UPDATE":
+        context["pending"] = None
+        return _prepare_bulk_move(targets, text, context)
     what = _titles_phrase(targets)
     ids = [event["id"] for event in targets]
+    # Occurrences of a repeating event are recolored at the series (one call,
+    # and the whole series follows).
+    series_ids = list(dict.fromkeys(event.get("recurring_id") or event["id"] for event in targets))
     context["pending"] = None
 
     if intent == "DELETE":
@@ -1328,11 +1964,11 @@ def _apply_to_all(intent, targets, text, context, note=""):
     if color is None:
         return f"I found {what}, but which color? Try saying something like 'make them red'.", context
     color_id, label = color
-    done, error = set_event_colors(ids, color_id)
+    done, error = set_event_colors(series_ids, color_id)
     if error:
         traceback.print_exception(error)
         return (
-            f"I changed {done} of {len(ids)} events before something went "
+            f"I changed {done} of {len(series_ids)} events before something went "
             "wrong with the calendar."
         ), context
     if color_id is None:
@@ -1370,7 +2006,12 @@ def _prepare_confirmation(intent, target, text_for_time, context):
             "intent": intent,
             "target": target,
         }
+        if target.get("is_series"):
+            return f"Delete the whole repeating {target['summary']}, every occurrence?", context
         return f"Delete {target['summary']} {_when(target, today)}?", context
+
+    if target.get("is_series"):
+        return _prepare_bulk_move([target], text_for_time, context)
 
     if target["start"] == "All day":
         return (
@@ -1419,13 +2060,21 @@ def handle_calendar_request(user_text, context, skip_read=False):
       candidates we already offered instead of being classified fresh
       as if it were an unrelated new request.
     """
+    user_text = _fix_speech(user_text)
     confirm_pending = context.pop("confirm_pending", None)
+    if confirm_pending and confirm_pending["intent"] == "STUDY_PLAN":
+        handled = _handle_study_plan(confirm_pending, user_text, context)
+        if handled is not None:
+            return handled
+        confirm_pending = None  # not an answer: drop the offer, treat as a new request
     if confirm_pending:
         if _is_affirmative(user_text):
             if confirm_pending["intent"] == "CREATE_MANY":
                 return _do_create_many(confirm_pending, context)
             if confirm_pending["intent"] == "DELETE_MANY":
                 return _do_delete_many(confirm_pending, context)
+            if confirm_pending["intent"] == "UPDATE_MANY":
+                return _do_update_many(confirm_pending, context)
             target = confirm_pending["target"]
             if confirm_pending["intent"] == "DELETE":
                 return _do_delete(target, context)
@@ -1444,14 +2093,21 @@ def handle_calendar_request(user_text, context, skip_read=False):
         # the change and handle this message as a fresh request instead
         # of swallowing it.
 
+    guessed = None
     pending = context.get("pending")
+    # A question ("what's on tomorrow") is a new request, never an answer to
+    # "which one?" -- even though it contains a day word that would fit.
+    if pending and _ASKING.search(user_text):
+        context["pending"] = pending = None
     if pending:
         candidates = pending["candidates"]
         named = _named_days(user_text)  # "the friday one", "tomorrow's"
         if named:
             candidates = _scope_to_days(candidates, named)
         # "all of them" / "each": the answer to "which one?" is every one.
-        if pending["intent"] in ("COLOR", "DELETE") and _WANTS_ALL.search(user_text):
+        if pending["intent"] in ("COLOR", "DELETE", "UPDATE") and _WANTS_ALL.search(user_text):
+            if not named:
+                candidates = _expand_to_group(candidates, time_utils.now())
             return _apply_to_all(pending["intent"], candidates, pending["original_text"], context)
         matches = _match_events(user_text, candidates)
         if len(matches) == 1:
@@ -1463,11 +2119,17 @@ def handle_calendar_request(user_text, context, skip_read=False):
             return _apply_to_target(
                 pending["intent"], target, pending["original_text"], context
             )
-        # Still can't tell -- drop the pending state and let it
-        # classify fresh rather than getting stuck in a loop forever.
+        # Still can't tell. If it isn't a new request either, it's most likely
+        # something misheard: ask again once instead of dropping the question
+        # and chatting about it. (A real new request goes on below.)
+        guessed = classify_intent(user_text)
+        if guessed == "NONE" and pending.get("prompt") and pending.get("tries", 0) < 1:
+            context["pending"] = {**pending, "tries": pending.get("tries", 0) + 1}
+            return f"Sorry, I didn't catch that. {pending['prompt']}", context
+        # Otherwise drop it rather than getting stuck in a loop forever.
         context["pending"] = None
 
-    intent = classify_intent(user_text)
+    intent = guessed if guessed is not None else classify_intent(user_text)
     print(f"  [calendar intent: {intent}]")
 
     if intent == "NONE":
@@ -1486,7 +2148,8 @@ def handle_calendar_request(user_text, context, skip_read=False):
         if repeat := _parse_repeat(user_text, ref):
             return _create_repeating(repeat, ref, context)
 
-        title_text = user_text
+        # "Good morning, add a break at 3pm": the greeting isn't part of the title.
+        title_text = re.sub(r"^\W*good\s+(?:morning|afternoon|evening)\W+", "", user_text, flags=re.IGNORECASE)
         parsed = _parse_new_event(user_text, ref)
         if not parsed:
             relative = _parse_relative_event(user_text, ref)
@@ -1506,6 +2169,9 @@ def handle_calendar_request(user_text, context, skip_read=False):
             context["last_event"] = new_event
             context["last_batch"] = None  # "them" no longer means the earlier batch
             return _added_reply(new_event, ref.date()), context
+
+        if _is_study_request(user_text):
+            return _offer_study_plan(user_text, ref, context)
 
         return (
             "I couldn't tell when that should be -- try something like "
@@ -1528,22 +2194,32 @@ def handle_calendar_request(user_text, context, skip_read=False):
             "can you tell me the title or time?"
         ), context
 
-    if status == "MANY" and intent in ("COLOR", "DELETE") and _WANTS_ALL.search(user_text):
-        # Only the next week was searched -- say so before deleting, unless
-        # the events came from a named day or the batch just created.
-        searched_week = not _named_days(user_text) and result is not context.get("last_batch")
+    if (
+        status == "MANY" and intent in ("COLOR", "DELETE", "UPDATE")
+        and (_WANTS_ALL.search(user_text) or _says_plural(user_text, result))
+    ):
+        # Only the next week was searched, so say so before deleting -- unless
+        # they all came from one request (then that whole request is meant,
+        # however far ahead it runs), or a day was named.
+        whole = result
+        if not _named_days(user_text):
+            whole = _expand_to_group(result, time_utils.now())
+        complete = whole is not result or result is context.get("last_batch")
+        searched_week = not _named_days(user_text) and not complete
         return _apply_to_all(
-            intent, result, user_text, context,
+            intent, whole, user_text, context,
             note=" over the next 7 days" if searched_week else "",
         )
 
     if status == "MANY":
         options = ", ".join(f"{e['summary']} {_when(e, today)}" for e in result)
+        prompt = f"I found a few things that could match: {options}. Which one did you mean?"
         context["pending"] = {
             "intent": intent,
             "candidates": result,
             "original_text": user_text,
+            "prompt": prompt,
         }
-        return f"I found a few things that could match: {options}. Which one did you mean?", context
+        return prompt, context
 
     return _apply_to_target(intent, result, user_text, context)  # status == "ONE"

@@ -11,6 +11,7 @@ won't have to log in again until the token expires.
 
 import datetime
 import os.path
+import uuid
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
@@ -22,6 +23,12 @@ import time_utils
 # calendar.events scope: full read/write on events specifically, without
 # the broader calendar-management permissions "calendar" would grant.
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
+
+# Every event Jarvis creates carries a hidden tag saying which request it came
+# from, so "the chemistry study blocks" can mean exactly that set of events
+# (found by the tag, not guessed from titles). It lives in the event's
+# private extended properties: invisible in Google Calendar, kept by Google.
+GROUP_KEY = "jarvis_group"
 
 # Google Calendar's fixed per-event color palette (colorId -> name as
 # shown in the Calendar UI). Events with no colorId use the calendar's
@@ -94,6 +101,13 @@ def _simplify_event(event):
         "start_iso": start_iso,
         "end_iso": end_iso,
         "color": EVENT_COLORS.get(event.get("colorId"), "default"),
+        # which Jarvis request created it (None for events made elsewhere)
+        "group": ((event.get("extendedProperties") or {}).get("private") or {}).get(GROUP_KEY),
+        # for one occurrence of a repeating event: the id of the whole series
+        "recurring_id": event.get("recurringEventId"),
+        # True for the repeating event itself (its id is the whole series)
+        "is_series": bool(event.get("recurrence")),
+        "created": event.get("created"),
     }
 
 
@@ -224,6 +238,25 @@ def set_event_colors(event_ids, color_id=None):
     )
 
 
+def update_events(items):
+    """Change the time of several events at once. `items` is a list of
+    (event_id, new_start_iso, new_end_iso), ISO strings with a timezone
+    offset. Returns (done, error), like the other bulk calls."""
+    creds = _get_credentials()
+    service = build("calendar", "v3", credentials=creds)
+    done = 0
+    try:
+        for event_id, start_iso, end_iso in items:
+            service.events().patch(
+                calendarId="primary", eventId=event_id,
+                body={"start": {"dateTime": start_iso}, "end": {"dateTime": end_iso}},
+            ).execute()
+            done += 1
+    except Exception as error:
+        return done, error
+    return done, None
+
+
 def delete_events(event_ids):
     """delete_event for many events at once. Returns (done, error)."""
     return _for_each_event(
@@ -232,6 +265,14 @@ def delete_events(event_ids):
             calendarId="primary", eventId=event_id
         ).execute(),
     )
+
+
+def new_group_id():
+    return uuid.uuid4().hex[:12]
+
+
+def _tags(group):
+    return {"private": {GROUP_KEY: group}}
 
 
 def insert_event(title: str, start_iso: str, end_iso: str) -> dict:
@@ -244,24 +285,25 @@ def insert_event(title: str, start_iso: str, end_iso: str) -> dict:
     """
     creds = _get_credentials()
     service = build("calendar", "v3", credentials=creds)
-    return _insert(service, title, start_iso, end_iso)
+    return _insert(service, title, start_iso, end_iso, new_group_id())
 
 
-def _insert(service, title, start_iso, end_iso):
+def _insert(service, title, start_iso, end_iso, group):
     created = service.events().insert(
         calendarId="primary",
         body={
             "summary": title,
             "start": {"dateTime": start_iso},
             "end": {"dateTime": end_iso},
+            "extendedProperties": _tags(group),
         },
     ).execute()
     return _simplify_event(created)
 
 
 def insert_events(items):
-    """Create several events over one connection. `items` is a list of
-    (title, start_iso, end_iso).
+    """Create several events over one connection, all tagged as one group.
+    `items` is a list of (title, start_iso, end_iso).
 
     Returns (created, error): the events that were made, and the exception
     that stopped the run (None if everything went through). A failure part
@@ -270,13 +312,66 @@ def insert_events(items):
     """
     creds = _get_credentials()
     service = build("calendar", "v3", credentials=creds)
+    group = new_group_id()
     created = []
     try:
         for title, start_iso, end_iso in items:
-            created.append(_insert(service, title, start_iso, end_iso))
+            created.append(_insert(service, title, start_iso, end_iso, group))
     except Exception as error:
         return created, error
     return created, None
+
+
+def get_calendar_timezone():
+    """The calendar's time zone as Google names it ("America/Toronto"), which
+    Google requires for a repeating event. It comes back on every events.list
+    reply, so no extra permission is needed. None if it can't be read."""
+    try:
+        creds = _get_credentials()
+        service = build("calendar", "v3", credentials=creds)
+        return service.events().list(calendarId="primary", maxResults=1).execute().get("timeZone")
+    except Exception:
+        return None
+
+
+def insert_recurring_event(title: str, start_iso: str, end_iso: str, rrule: str, timezone: str) -> dict:
+    """Create ONE repeating event. `start_iso`/`end_iso` are its first
+    occurrence, `rrule` is the recurrence line ("RRULE:FREQ=DAILY;COUNT=14"),
+    and `timezone` the calendar's IANA zone name. Tagged as its own group.
+
+    Returns the series' first event, same shape as get_events(); its id is
+    the id of the whole series."""
+    creds = _get_credentials()
+    service = build("calendar", "v3", credentials=creds)
+    created = service.events().insert(
+        calendarId="primary",
+        body={
+            "summary": title,
+            "start": {"dateTime": start_iso, "timeZone": timezone},
+            "end": {"dateTime": end_iso, "timeZone": timezone},
+            "recurrence": [rrule],
+            "extendedProperties": _tags(new_group_id()),
+        },
+    ).execute()
+    return _simplify_event(created)
+
+
+def get_group_events(group, start, end):
+    """The events Jarvis created together (same group tag) that overlap
+    [start, end], repeating ones expanded into their occurrences, in order.
+    Found by the tag, so it isn't limited to a few days or to matching titles."""
+    creds = _get_credentials()
+    service = build("calendar", "v3", credentials=creds)
+    result = service.events().list(
+        calendarId="primary",
+        timeMin=start.isoformat(),
+        timeMax=end.isoformat(),
+        privateExtendedProperty=f"{GROUP_KEY}={group}",
+        singleEvents=True,
+        orderBy="startTime",
+        maxResults=250,
+    ).execute()
+    return [_simplify_event(event) for event in result.get("items", [])]
 
 
 def create_event(event_description: str) -> dict:

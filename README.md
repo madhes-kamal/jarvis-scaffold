@@ -12,6 +12,7 @@ model pick an event or act on a guess.
 - `calendar_service.py` — Google Calendar OAuth, reading events over any date range (with real IDs and colors), and low-level create/update/delete/recolor
 - `calendar_manager.py` — classifies each request (create/read/update/delete/color/time/none), answers time and look-ahead questions, resolves "that meeting" to a real event ID, asks for confirmation before moves and deletes, and handles follow-up answers ("the 7:15 one", "yes")
 - `brief_generator.py` — builds the morning briefing from templates in Python (no LLM involved — guarantees accuracy, used only when you say "good morning")
+- `heads_up.py` — the look-ahead part of "good morning": finds tests/quizzes/deadlines in the next 14 days, checks whether prep time is scheduled, and plans study blocks around what's already on your calendar
 - `conversation.py` — general chat fallback for anything not calendar-related, plus `extract_event_title`, the one small job the model does when you add an event (naming it). `extract_event_phrase` is the old "model writes the whole quick-add phrase" helper and is no longer used
 - `llm_client.py` — the single place every LLM call goes through; swap models or backends here, not in the other files
 - `voice.py` — wake-word detection (openWakeWord), speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
@@ -91,6 +92,55 @@ search: "do I have a chemistry test?" only reports events with those words in
 the title ("test", "exam" and "quiz" count as the same word). Replies for
 other days say which day: "Tomorrow: School at 08:20 AM. Friday: ...".
 
+**"Good morning".** Reads what's left of today, then a heads-up about tests,
+quizzes, exams, midterms, finals, deadlines, presentations and things "due" in
+the next 14 days (`HEADS_UP_DAYS` in `heads_up.py`), at most 3, nearest first.
+Anything on a title that repeats on 3+ days is a routine, not a heads-up. For
+each one it counts the study/prep events for the same subject that finish
+*before* it starts ("Chemistry test" → events with "chemistry" and study, prep,
+review, practice or homework in the title): "…Chemistry test on Friday at 10:00
+AM, with 4 chemistry study blocks lined up before it" or "…and nothing is
+scheduled to prep for it yet, so make sure to prep ahead of that."
+
+If the nearest test with a subject has no prep, the brief ends on an offer, and
+your next words answer it (no wake word): "Want me to add 5 chemistry study
+blocks at 06:30 PM, from today through Thursday?"
+- **yes** adds them (45 minutes each, one a day up to the day before, at most
+  the last 7 days).
+- **a time** ("7", "3:30 pm", "how about 8") re-plans at that time.
+- **no** asks what time works; **no thanks** / **not now** drops it.
+
+**Asking for study blocks directly.** "Add study blocks for my chemistry test"
+(or "study periods", and "sturdy blocks" / "study plots", which is what
+speech-to-text tends to make of them) finds that test on your calendar and
+makes the same offer the morning brief does, at 6:30 PM unless you say a time
+("...at 3:30 pm"). If you don't name the subject, or Whisper mishears it
+("camera"), and there are several tests, Jarvis lists them and asks which one.
+Plural "study blocks" means a series; a singular "study block at 6pm" is one
+event. With "every day" or "after my bus" the blocks stop the day before the
+test. Anything that spans time without saying "every" -- "until Friday", "for 5
+days" -- is a series too, and any series that lands on something already on
+your calendar warns you how many overlap.
+
+**Study blocks with no test, and days to leave out.** "Add chemistry study
+blocks this week" (or "until Friday", "for 5 days") plans those days at 6:30
+PM the same way, even when there's no test on the calendar. You can leave days
+out: "...to the days I don't have Code Ninjas", "...except code ninjas days",
+"...except Tuesday and Thursday", "...skip weekends". Left-out days are
+dropped, not moved, and Jarvis names the days it's using ("today, Monday,
+Wednesday and Friday"). If a test exists for that subject, the blocks always
+stop the day before it, even if you said "this week". If you name a subject
+that isn't a test on the calendar ("chemistry", but only a Business quiz
+exists), Jarvis says so and offers the tests it does see.
+
+The time is always checked against your calendar. If it's taken, that day's
+block moves to right after whatever is in the way, and Jarvis says so: "On
+Monday through Thursday 03:30 PM clashes with Bus, so those go right after it,
+at 03:50 PM." A day where that would run past 10 PM (`LATEST_STUDY_END_MINUTES`)
+is skipped. There is no separate file of your schedule: the calendar is the
+source of truth for when you're busy. If "good morning" also carries a request
+("good morning, add a break at 3"), the request is handled and no offer is made.
+
 **Routines.** In a week summary, an event that shows up on 3 or more
 different days is described as a pattern instead of listed day by day:
 "You have School on weekdays from 08:20 AM to 02:42 PM; Code Ninjas on
@@ -126,14 +176,49 @@ ordinary separate events (not a Google "recurring series"), so changing or
 deleting one leaves the rest alone. Editing or deleting a whole series in one
 go isn't supported yet.
 
+**Repeating events and groups.** Every event Jarvis creates carries a hidden
+tag (in the event's private extended properties: invisible in Google Calendar)
+naming the request it came from, so "the chemistry study blocks" means exactly
+that set of events, however far ahead they run, instead of a guess from
+titles. Two things follow:
+- When the days form a regular pattern at one time ("every day at 6:30",
+  "Monday, Wednesday and Friday at 4"), Jarvis makes **one repeating event**
+  (Google's own recurrence), so it's a single thing to recolor, move or delete in
+  Google Calendar too. It says so: "Added ...: 14 events, as one repeating
+  event." Recoloring or deleting "them" acts on the series as a whole.
+- When a plan adapts (a day moved after Code Ninjas, "after my bus", days left
+  out) the times differ, which a repeating event can't express, so it stays
+  separate events -- but they share one tag, so recolor/delete "all of them"
+  still means the whole plan (`get_group_events`). If a repeating event isn't
+  possible (Google refuses, or the calendar's time zone can't be read) it falls
+  back to separate events.
+- After a restart, "make them red" means the most recent thing Jarvis made.
+  With nothing Jarvis-made to refer to, it asks instead of guessing.
+- Events made before this (or by hand) have no tag and are matched by title as
+  before. Moving a whole repeating event isn't supported yet; moving one
+  occurrence is.
+
 **Changing several at once.** "Change the color of each of those chemistry
 study blocks to dark green", "make them red" (the events just added), "reset
 all my chemistry study blocks to the default color". Words like all / each /
 every / those / them mean every match instead of one. Recoloring just happens;
 deleting several asks first, and says what it found: "Delete all 6 events (5
 Chemistry study block, 1 Chemistry test) over the next 7 days?". If Jarvis asks
-"which one?", "all of them" is a valid answer. Moving many events at once isn't
-supported. Like everything that edits events, this only looks at today plus the
+"which one?", "all of them" is a valid answer.
+
+**Moving several at once.** "Move all the chemistry study blocks to start at 4
+p.m." (also "...at 350 p.m. to start at 4 p.m.", "move them to 4pm", "so they
+start at 4") changes the start time of every one: each keeps its own day and its
+length, Jarvis asks first, and says how many would land on something already on
+your calendar. It can't change the *day* of several at once. A repeating event
+is moved through its individual occurrences. The time after "to" / "to start at" is
+where they're going, not which events you mean, so "4 p.m." no longer picks
+whatever happens to start at 4.
+
+**Not understanding an answer.** If Jarvis asks "which one?" and what it hears
+is neither an answer nor a new request (mostly a misheard or garbled
+transcript), it says "Sorry, I didn't catch that" and repeats the options once,
+then gives up. A question ("what's on tomorrow") is always a new request. Like everything that edits events, this only looks at today plus the
 next 7 days.
 
 Moving, deleting and recoloring look at today plus the next 7 days
@@ -147,7 +232,9 @@ something ("Move Break to 04:30 PM?" or "Which one did you mean?"), just
 answer. If you say nothing for 8 seconds (`ANSWER_TIMEOUT` in `main.py`)
 the question is dropped. Anything that isn't a clear yes or no is treated
 as a new request instead of a confirmation, and an unclear answer never
-confirms a delete or move.
+confirms a delete or move. A yes or no has to be short (a "no" up to 6 words, a
+"yes" up to 8): a long sentence that merely contains "don't" or "sure" is a new
+request, not an answer.
 
 **Colors:** everyday words are mapped to the nearest Google Calendar event
 color (red → Tomato, blue → Blueberry, light blue → Peacock, green →
@@ -183,6 +270,18 @@ model file is missing, run
   treated as the *new* time, not as a description of the event. If it's
   failing to find an obvious event, that function is the one to improve,
   not the LLM prompt. The `[match: ...]` lines show each filtering step.
+- If Jarvis stops listening in the middle of a sentence: the `speech_recognition`
+  library's default keeps re-raising its "this is silence" level to 1.5x
+  however loudly you're talking, so a softer stretch of a sentence counts as
+  silence and the recording ends. `voice.py` measures your room once at
+  startup and holds that level fixed (`MIN_ENERGY_THRESHOLD` is its floor),
+  and waits `PAUSE_SECONDS` (1.5) of silence before ending a request. Lower
+  `PAUSE_SECONDS` if Jarvis feels slow to respond; raise it if you still get
+  cut off while thinking mid-sentence.
+- Whisper is given a vocabulary hint (`BASE_VOCABULARY` in `voice.py` plus the
+  titles on your calendar, refreshed every 30 minutes) so it prefers "study
+  blocks" and "chemistry" over soundalikes. Add words there if it keeps
+  mishearing something.
 - If voice transcription is garbled, try a bigger Whisper model in
   `voice.py` (`WhisperModel("small", ...)` instead of `"base"`) — slower,
   more accurate. Whisper's VAD filter and no-speech check are on, so

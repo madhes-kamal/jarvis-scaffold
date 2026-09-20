@@ -75,15 +75,61 @@ def _format_event_list(events):
     return ". ".join(parts) + "."
 
 
-def generate_brief(events):
-    if not events:
-        return f"{random.choice(OPENERS)} {random.choice(NO_EVENTS_LINES)}"
+HEADS_UP_LEADS = [
+    "Heads up, sir:",
+    "One thing to keep in mind, sir:",
+    "Looking ahead, sir:",
+]
 
+
+def _prep_clause(item):
+    """How to say whether prep time is set aside. `prep_count` is None when
+    the event has no recognisable subject (nothing to look for), otherwise
+    how many study/prep events already sit before it."""
+    count, soon = item["prep_count"], item["soon"]
+    if count:
+        plural = "block" if count == 1 else "blocks"
+        return f", with {count} {item['subject']} study {plural} lined up before it"
+    if count == 0:
+        if soon:
+            return ", and nothing is scheduled to prep for it"
+        return ", and nothing is scheduled to prep for it yet, so make sure to prep ahead of that"
+    return ", so make sure you're ready" if soon else ", so make sure to prep ahead of that"
+
+
+def _format_heads_up(items, more=0):
+    """Builds the look-ahead sentences. As with the event list, the facts
+    (titles, days, counts) are inserted straight from calendar data."""
+    if not items:
+        return ""
+    sentences = []
+    for i, item in enumerate(items):
+        lead = random.choice(HEADS_UP_LEADS) + " you have" if i == 0 else "You also have"
+        sentences.append(f"{lead} {item['title']} {item['when']}{_prep_clause(item)}.")
+    if more:
+        sentences.append(f"There {'is' if more == 1 else 'are'} {more} more after that.")
+    return " ".join(sentences)
+
+
+def generate_brief(events, heads_up=None, offer=None, more=0):
+    """events: what's left of today. heads_up: dicts describing tests,
+    quizzes and deadlines coming up (title, when, soon, subject,
+    prep_count). offer: a question to end on, like "Want me to add study
+    blocks...?", which replaces the closing line."""
     opener = random.choice(OPENERS)
-    closer = random.choice(CLOSERS)
-    body = _format_event_list(events)
+    heads_up_text = _format_heads_up(heads_up, more)
 
-    return f"{opener} {body} {closer}"
+    if not events:
+        parts = [opener, random.choice(NO_EVENTS_LINES)]
+    else:
+        parts = [opener, _format_event_list(events)]
+    if heads_up_text:
+        parts.append(heads_up_text)
+    if offer:
+        parts.append(offer)
+    elif events:
+        parts.append(random.choice(CLOSERS))
+    return " ".join(parts)
 
 
 if __name__ == "__main__":
