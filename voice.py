@@ -21,6 +21,7 @@ import asyncio
 import atexit
 import io
 import os
+import re
 import tempfile
 import time
 
@@ -203,8 +204,19 @@ async def _speak_async(text):
         os.remove(temp_path)
 
 
+# Emoji and pictograph symbols: the model uses them despite being told not to;
+# a Windows console can't print them (that raised UnicodeEncodeError and broke
+# the reply) and a voice would only mumble them.
+_PICTOGRAPHS = re.compile("[\U0001F000-\U0001FFFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F\u200D]")
+
+
+def _speakable(text):
+    return re.sub(r"\s{2,}", " ", _PICTOGRAPHS.sub("", text)).strip()
+
+
 def speak(text):
     """Speak text out loud. Requires internet (edge-tts is a cloud voice)."""
+    text = _speakable(text)
     print(f"Jarvis: {text}")
     asyncio.run(_speak_async(text))
     time.sleep(0.3)  # let the speakers' tail die away before listening again

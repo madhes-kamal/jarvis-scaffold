@@ -215,6 +215,43 @@ is moved through its individual occurrences. The time after "to" / "to start at"
 where they're going, not which events you mean, so "4 p.m." no longer picks
 whatever happens to start at 4.
 
+**Changing how long events are.** One event or many ("them", "all the chemistry
+study blocks", a repeating event's occurrences). The start never moves:
+- set a length: "make my break 45 minutes long", "make it an hour and a half
+  long", "the break should be 25 minutes", "change the length of the study
+  blocks to an hour"
+- add or take away time: "extend the break by 15 minutes", "add 15 minutes to
+  my break", "make them 30 minutes longer", "shorten it by 10 minutes",
+  "make my break 20 minutes shorter"
+- set the end time: "make my break end at 5 pm", "change the end time to 4:30"
+Jarvis asks first ("Make Break 45 minutes long, until 03:45 PM?") and warns if
+the change would land on something already on your calendar. With no amount ("make
+it longer") it asks how much. It won't shrink an event below 5 minutes or make
+it longer than a day, or set an end time before the start. These requests are
+recognised in Python, so they can't be mistaken for creating a new event.
+
+**Renaming events.** "Rename my break to lunch", "change the title of my
+meeting to team sync", "retitle it as ...", and once you're talking about
+something, "call it lunch" / "call them chem review". It works on one event or
+many ("rename the chemistry study blocks to Chem review"; "all of them" answers
+"which one?"), and a repeating event is renamed once, at the series. Only the
+part naming the events is used to find them, so the new name can't be mistaken for
+the event ("rename my break to friday plan" isn't about Friday). It just happens
+(rename it back to undo), and the reply names both titles: "Renamed Break to
+Lunch." Asking for something that isn't on the calendar at all ("delete my
+nonexistent thing") now says it couldn't find it, instead of listing today's events.
+
+**Things Jarvis can't do, and things it didn't understand.** Inviting people
+and setting reminders/alarms/timers aren't supported yet, and
+Jarvis says so plainly ("I can't invite people yet."). A calendar-sounding
+request it didn't understand ("change my class thing") gets a "say it plainly"
+hint with examples instead of a chat answer. Both are decided in Python; the
+small chat model used to make things up ("I'll invite Sam to your meeting", "I
+don't have access to your calendar"). The chat model's only calendar tool is
+now read-only (`get_upcoming_events`), so it can no longer create events from
+text it wrote itself. Emoji in replies are stripped before printing and
+speaking (a Windows console can't print them).
+
 **Not understanding an answer.** If Jarvis asks "which one?" and what it hears
 is neither an answer nor a new request (mostly a misheard or garbled
 transcript), it says "Sorry, I didn't catch that" and repeats the options once,

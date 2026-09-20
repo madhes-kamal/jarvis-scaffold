@@ -257,6 +257,17 @@ def update_events(items):
     return done, None
 
 
+def set_event_titles(event_ids, title):
+    """Rename events by ID. Returns (done, error), like the other bulk calls.
+    Renaming a repeating event's id renames the whole series."""
+    return _for_each_event(
+        event_ids,
+        lambda service, event_id: service.events().patch(
+            calendarId="primary", eventId=event_id, body={"summary": title}
+        ).execute(),
+    )
+
+
 def delete_events(event_ids):
     """delete_event for many events at once. Returns (done, error)."""
     return _for_each_event(

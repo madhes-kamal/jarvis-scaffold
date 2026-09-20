@@ -37,12 +37,12 @@ from calendar_service import (
     get_events, event_day, has_not_ended, insert_event, insert_events,
     insert_recurring_event, get_calendar_timezone, get_group_events,
     delete_event, delete_events, update_event, update_events,
-    set_event_color, set_event_colors,
+    set_event_color, set_event_colors, set_event_titles,
 )
 from conversation import extract_event_title
 from llm_client import chat_completion
 
-VALID_INTENTS = {"CREATE", "READ", "UPDATE", "DELETE", "COLOR", "TIME", "NONE"}
+VALID_INTENTS = {"CREATE", "READ", "UPDATE", "DELETE", "COLOR", "TIME", "RESIZE", "RENAME", "NONE"}
 
 # How far ahead update/delete/color look for the event you mean (in days,
 # counting today), and how far a search like "do I have a chemistry test?"
@@ -260,6 +260,10 @@ def classify_intent(user_text):
         return "TIME"
     if _FREE_OR_BUSY.search(user_text) or _is_schedule_request(user_text):
         return "READ"
+    if _parse_rename(user_text) is not None:
+        return "RENAME"  # "rename my break to lunch", "call it lunch"
+    if _parse_resize(user_text) is not None:
+        return "RESIZE"  # "make it 45 minutes long", "end at 5": not a new event, not a move
     if _COLOR_RESET.search(user_text) and re.search(r"colou?r", user_text, re.IGNORECASE):
         return "COLOR"  # "reset ... to the default color": too easy for the small model to miss
     if _is_study_request(user_text):
@@ -372,6 +376,7 @@ def _match_events(user_text, events):
     to include an event regardless of whether the time matched.
     """
     target_text, _ = _split_target_and_destination(user_text)
+    target_text = _strip_length_phrases(target_text)  # "35 minutes" is not the hour 35
     # A spoken date ("september 25") would otherwise read as the hour 25.
     lowered = _normalize_meridian(time_utils.strip_date_expressions(target_text))
     lowered = _normalize_bare_times(lowered)
@@ -391,7 +396,10 @@ def _match_events(user_text, events):
         "change", "update", "reschedule", "the", "my", "at", "on", "from",
         "to", "a", "an", "please", "can", "you", "could", "would", "am", "pm",
         "each", "every", "all", "both", "those", "these", "them", "of", "for",
-        "and", "or", "in", "one", "ones",
+        "and", "or", "in", "one", "ones", "extend", "lengthen", "shorten",
+        "stretch", "trim", "shrink", "reduce", "length", "duration", "long",
+        "longer", "shorter", "by", "end", "ends", "another", "make", "it",
+        "event", "events", "thing", "things", "stuff", "everything", "anything",
     }
     meaningful_words = (
         text_words - generic_words - _COLOR_TOKENS - time_utils.RANGE_WORDS
@@ -426,6 +434,10 @@ def _match_events(user_text, events):
         ]
         if by_all_words:
             candidates = by_all_words
+    elif meaningful_words and not time_match:
+        # The message names something and nothing on the calendar has those
+        # words: "not found", not "here's everything today".
+        candidates = []
     print(f"  [match: {len(candidates)} after title filter: {[e['summary'] for e in candidates]}]")
 
     return candidates
@@ -468,6 +480,12 @@ def _expand_to_group(targets, ref):
     except Exception:
         return targets
     return found or targets
+
+
+def _one_series(events):
+    """True if these are all days of the same repeating event."""
+    ids = {event.get("recurring_id") for event in events}
+    return len(events) > 1 and len(ids) == 1 and None not in ids
 
 
 def _says_plural(text, events):
@@ -1847,11 +1865,99 @@ def _do_color(target, text, context):
     return f"Made {target['summary']} {label}.", context
 
 
+# --- renaming events
+
+_RENAME_VERB = r"(?:rename|retitle|re-name|re-title)"
+_RENAME_TO = re.compile(rf"\b{_RENAME_VERB}\s+(?P<target>.+)\s+(?:to|as|into)\s+(?P<new>.+)", re.IGNORECASE)
+_RENAME_TITLE_OF = re.compile(
+    r"\b(?:change|edit|update|set)\s+(?:the\s+)?(?:name|title)\s+(?:of|for)\s+(?P<target>.+)"
+    r"\s+(?:to|as)\s+(?P<new>.+)",
+    re.IGNORECASE,
+)
+_RENAME_POSSESSIVE = re.compile(
+    r"\b(?:change|edit|update)\s+(?P<target>.+?)(?:'s|s')\s+(?:name|title)\s+(?:to|as)\s+(?P<new>.+)",
+    re.IGNORECASE,
+)
+# "call it lunch" -- but not "call mom", so only with a word that points back.
+_CALL_IT = re.compile(r"\bcall\s+(?P<target>it|that|this|them|those|these)\s+(?P<new>.+)", re.IGNORECASE)
+_RENAME_BARE = re.compile(
+    rf"\b{_RENAME_VERB}\b|\b(?:change|edit|update)\s+(?:the\s+)?(?:name|title)\b", re.IGNORECASE
+)
+# "call it a day" is not a new name.
+_NOT_A_NAME = {"a day", "a night", "a wrap", "off", "quits", "it quits", "it a day"}
+
+
+def _clean_title(text):
+    """A spoken new name -> a tidy title: no quotes, trailing punctuation or
+    "please"; first letter capitalised. None if nothing usable is left."""
+    edge = " \t\"'“”‘’.?!,;:"  # quotes and punctuation, in any order
+    text = text.strip(edge)
+    text = re.sub(r"\s+(?:please|thanks|thank you)$", "", text, flags=re.IGNORECASE).strip(edge)
+    text = re.sub(r"\s{2,}", " ", text)
+    if not text or len(text.split()) > 12:
+        return None
+    return text[:1].upper() + text[1:]
+
+
+def _parse_rename(text):
+    """Is this a request to rename events? Returns (the part of the message
+    naming the events, the new title or None) -- or None if it isn't a rename.
+    Only the first part is used to FIND the events; the new name mustn't be,
+    or "rename my break to lunch" would go looking for a "lunch"."""
+    text = text.replace("’", "'")
+    for pattern in (_RENAME_TITLE_OF, _RENAME_POSSESSIVE, _RENAME_TO, _CALL_IT):
+        if match := pattern.search(text):
+            new = _clean_title(match["new"])
+            if pattern is _CALL_IT and (new is None or new.lower() in _NOT_A_NAME):
+                continue
+            return match["target"].strip(), new
+    if _RENAME_BARE.search(text):
+        return _RENAME_BARE.sub(" ", text).strip(), None
+    return None
+
+
+def _do_rename(targets, text, context):
+    """Give one or several events a new title. Recoloring-style: it just
+    happens (it's easy to say back), and the reply names the old title so it
+    can be undone. A repeating event is renamed once, at the series."""
+    parsed = _parse_rename(text)
+    new_title = parsed[1] if parsed else None
+    context["pending"] = None
+    if not new_title:
+        return "What should I call it? Try 'rename my break to lunch'.", context
+
+    todo = [event for event in targets if event["summary"] != new_title]
+    if not todo:
+        return f"It's already called {new_title}." if len(targets) == 1 else "They're already called that.", context
+    what = _series_phrase(todo) if _one_series(todo) else _titles_phrase(todo)
+    ids = list(dict.fromkeys(event.get("recurring_id") or event["id"] for event in todo))
+    done, error = set_event_titles(ids, new_title)
+    if error:
+        traceback.print_exception(error)
+        return (
+            f"I renamed {done} of {len(ids)} events before something went "
+            "wrong with the calendar."
+        ), context
+
+    # "it" / "them" still mean these events, under their new name.
+    renamed = [{**event, "summary": new_title} for event in todo]
+    context["last_event"] = renamed[-1]
+    if len(renamed) > 1:
+        context["last_batch"] = renamed
+    return f"Renamed {what} to {new_title}.", context
+
+
 # "make them green", "delete those" -- the events just added together.
 _BATCH_REF = re.compile(r"\b(?:those|these|them)\b", re.IGNORECASE)
 # "all of them", "each of those", "every chemistry study block": every match,
 # not one of them.
 _WANTS_ALL = re.compile(r"\b(?:all|every|each|both|everything)\b|\b(?:those|these|them)\b", re.IGNORECASE)
+
+
+def _series_phrase(targets):
+    """"the repeating Meditation event" -- it's one event, however many of
+    its days were found."""
+    return f"the repeating {targets[0]['summary']} event"
 
 
 def _titles_phrase(targets):
@@ -1868,19 +1974,141 @@ def _titles_phrase(targets):
     return f"all {len(targets)} events ({breakdown})"
 
 
+# --- changing when events start, and how LONG they are
+
+# The shortest and longest an event can be made by voice.
+MIN_EVENT_MINUTES = 5
+MAX_EVENT_MINUTES = 24 * 60
+
+_AN_HOUR_AND_A_HALF = re.compile(r"\b(?:an?|one)\s+hour\s+and\s+a\s+half\b", re.IGNORECASE)
+_N_AND_A_HALF_HOURS = re.compile(rf"\b(?P<n>{_AMOUNT})\s+and\s+a\s+half\s+hours?\b", re.IGNORECASE)
+_EXTEND = re.compile(
+    r"\b(?:extend|lengthen|stretch|prolong)\b"
+    rf"|\badd\s+(?:another\s+)?(?:{_AMOUNT})[\s-]+{_UNIT}\s+(?:on\s+)?to\b"
+    rf"|\banother\s+(?:{_AMOUNT})[\s-]+{_UNIT}\b",
+    re.IGNORECASE,
+)
+_SHORTEN = re.compile(r"\b(?:shorten|shrink|trim|reduce)\b|\bcut\b.*\bby\b", re.IGNORECASE)
+_LONGER = re.compile(r"\blonger\b", re.IGNORECASE)
+_SHORTER = re.compile(r"\bshorter\b", re.IGNORECASE)
+_SET_LENGTH = re.compile(
+    r"\b(?:length|duration)\b"
+    rf"|\b(?:{_AMOUNT})[\s-]+{_UNIT}\s+long\b"
+    rf"|\b(?:change|make|set|adjust|update)\b.*\bto\s+(?:be\s+)?(?:{_AMOUNT})[\s-]+{_UNIT}\b",
+    re.IGNORECASE,
+)
+_END_AT = re.compile(
+    r"\bend(?:s|ing)?\s+(?:time\s+)?(?:to\s+|at\s+|by\s+)?(?=\d|noon\b|midnight\b)", re.IGNORECASE
+)
+# What a length or end-time request adds to the message: none of it says WHICH
+# events, and "35 minutes" must not be read as the hour 35.
+_LENGTH_WORDS = re.compile(
+    rf"\b(?:{_AMOUNT})[\s-]+{_UNIT}\b|\band\s+a\s+half\b|\bhalf\s+an?\s+hour\b"
+    r"|\bend(?:s|ing)?\s+(?:time\s+)?(?:to\s+|at\s+|by\s+)?\d{1,2}(?:[:.]\d{2})?\s*(?:[ap]\.?\s?m\.?)?",
+    re.IGNORECASE,
+)
+
+
+def _strip_length_phrases(text):
+    return _LENGTH_WORDS.sub(" ", text)
+
+
+def _amount_value(amount):
+    key = re.sub(r"[\s-]+", " ", amount.lower())
+    return _WORD_AMOUNTS[key] if key in _WORD_AMOUNTS else float(key)
+
+
+def _parse_length_minutes(text):
+    """A length in the message -- "45 minutes", "an hour", "an hour and a
+    half", "1 hour 30 minutes", "half an hour" -- as whole minutes, or None."""
+    total, found = 0.0, False
+    if match := _AN_HOUR_AND_A_HALF.search(text):
+        total, found, text = total + 90, True, _cut(text, match)
+    if match := _N_AND_A_HALF_HOURS.search(text):
+        total, found, text = total + _amount_value(match["n"]) * 60 + 30, True, _cut(text, match)
+    for match in _LASTS.finditer(text):
+        found = True
+        total += 30 if not match["n"] else _amount_minutes(match["n"], match["unit"])
+    return int(round(total)) if found else None
+
+
+def _human_minutes(minutes):
+    if minutes < 60:
+        return "1 minute" if minutes == 1 else f"{minutes} minutes"
+    hours, rest = divmod(minutes, 60)
+    if rest == 0:
+        return "an hour" if hours == 1 else f"{hours} hours"
+    if hours == 1 and rest == 30:
+        return "an hour and a half"
+    return f"{hours} hour{'s' if hours != 1 else ''} {rest} minutes"
+
+
+def _parse_resize(text):
+    """Is this a request to change how long events are? Returns (kind, value)
+    or None. kind is "set" (value: the new length in minutes), "add" (value:
+    minutes to add, negative to take away) or "end" (value: the new end time,
+    minutes after midnight). value is None when the message doesn't say how
+    much ("make it longer"), so Jarvis can ask."""
+    lowered = text.lower().replace("’", "'")
+    if found := _END_AT.search(lowered):
+        return "end", _answer_time(lowered[found.end():])
+    minutes = _parse_length_minutes(lowered)
+    wants_change = minutes is not None or re.search(r"\bmake\b", lowered)
+    if _EXTEND.search(lowered) or (_LONGER.search(lowered) and wants_change):
+        return "add", minutes
+    if _SHORTEN.search(lowered) or (_SHORTER.search(lowered) and wants_change):
+        return "add", (-minutes if minutes is not None else None)
+    if _SET_LENGTH.search(lowered):
+        return "set", minutes
+    if minutes is not None and re.search(r"\blong\b|\b(?:should|needs?\s+to|has\s+to)\s+be\b", lowered):
+        return "set", minutes  # "an hour and a half long", "the break should be 25 minutes"
+    return None
+
+
+def _changeable(targets):
+    """The individual timed events among `targets`. A repeating event stands
+    for its occurrences; all-day events have no time to change."""
+    now = time_utils.now()
+    events = []
+    for event in targets:
+        if event.get("is_series"):
+            events += [e for e in _expand_to_group([event], now) if not e.get("is_series")]
+        elif event["start"] != "All day":
+            events.append(event)
+    return events
+
+
+def _finish_time_change(items, context, question, done):
+    """Ask before changing the times of `items` -- (event, new start, new
+    end) -- and say how many of them would then land on something already on
+    the calendar."""
+    moved_ids = {event["id"] for event, _, _ in items}
+    busy = [
+        (datetime.datetime.fromisoformat(b["start_iso"]), datetime.datetime.fromisoformat(b["end_iso"]))
+        for b in get_events(min(s for _, s, _ in items), max(e for _, _, e in items))
+        if b["start"] != "All day" and b["id"] not in moved_ids
+    ]
+    overlapping = sum(1 for _, s, e in items if any(b0 < e and b1 > s for b0, b1 in busy))
+
+    context["confirm_pending"] = {
+        "intent": "UPDATE_MANY",
+        "items": [(event["id"], s.isoformat(), e.isoformat()) for event, s, e in items],
+        "done": done,
+    }
+    text = f"{question}?"
+    if overlapping and len(items) == 1:
+        text += " That would overlap something already on your calendar."
+    elif overlapping:
+        text += f" {overlapping} of them would overlap something already on your calendar."
+    return text, context
+
+
 def _prepare_bulk_move(targets, text, context):
     """Change the START TIME of several events at once ("move all the
     chemistry study blocks to start at 4"). Each keeps its own day and its
-    length; only the time of day changes. Asks first, and says how many of
-    them would land on something already on the calendar. A repeating event
-    is moved through its individual occurrences."""
-    now = time_utils.now()
-    movable = []
-    for event in targets:
-        if event.get("is_series"):
-            movable += [e for e in _expand_to_group([event], now) if not e.get("is_series")]
-        elif event["start"] != "All day":
-            movable.append(event)
+    length; only the time of day changes. Asks first. A repeating event is
+    moved through its individual occurrences."""
+    movable = _changeable(targets)
     if not movable:
         return (
             "I couldn't find individual events to move there (all-day or "
@@ -1911,24 +2139,65 @@ def _prepare_bulk_move(targets, text, context):
     if not items:
         return "They already start then.", context
 
-    moved_ids = {event["id"] for event, _, _ in items}
-    busy = [
-        (datetime.datetime.fromisoformat(b["start_iso"]), datetime.datetime.fromisoformat(b["end_iso"]))
-        for b in get_events(min(s for _, s, _ in items), max(e for _, _, e in items))
-        if b["start"] != "All day" and b["id"] not in moved_ids
-    ]
-    overlapping = sum(1 for _, s, e in items if any(b0 < e and b1 > s for b0, b1 in busy))
-
     spoken = f"{_titles_phrase([event for event, _, _ in items])} to {items[0][1]:%I:%M %p}"
-    context["confirm_pending"] = {
-        "intent": "UPDATE_MANY",
-        "items": [(event["id"], s.isoformat(), e.isoformat()) for event, s, e in items],
-        "spoken": spoken,
-    }
-    text = f"Move {spoken}?"
-    if overlapping:
-        text += f" {overlapping} of them would overlap something already on your calendar."
-    return text, context
+    return _finish_time_change(items, context, f"Move {spoken}", f"Moved {spoken}.")
+
+
+def _prepare_resize(targets, text, context):
+    """Change how LONG one or several events are: "make it 45 minutes long",
+    "extend the study blocks by 15 minutes", "shorten it by 10", "make them
+    end at 5 pm". The start stays put. Asks first."""
+    kind, value = _parse_resize(text) or ("set", None)
+    if value is None:
+        return (
+            "By how much? Try 'make it 45 minutes long', 'extend it by 15 "
+            "minutes' or 'end at 5 pm'."
+        ), context
+    movable = _changeable(targets)
+    if not movable:
+        return (
+            "I couldn't find individual events to change there (all-day or "
+            "repeating). Change it in Google Calendar, or name one day's."
+        ), context
+
+    items, refused = [], 0
+    for event in movable:
+        start = datetime.datetime.fromisoformat(event["start_iso"])
+        end = datetime.datetime.fromisoformat(event["end_iso"])
+        if kind == "set":
+            new_end = start + datetime.timedelta(minutes=value)
+        elif kind == "add":
+            new_end = end + datetime.timedelta(minutes=value)
+        else:
+            new_end = start.replace(hour=value // 60, minute=value % 60, second=0, microsecond=0)
+        length = (new_end - start).total_seconds() / 60
+        if not MIN_EVENT_MINUTES <= length <= MAX_EVENT_MINUTES:
+            refused += 1
+        elif new_end != end:
+            items.append((event, start, new_end))
+    if not items:
+        if not refused:
+            return ("They already end then." if kind == "end" else "They're already that long."), context
+        if kind == "end":
+            return "That would end it before it even starts.", context
+        return (
+            f"That wouldn't leave a sensible length -- at least {MIN_EVENT_MINUTES} "
+            "minutes, at most a day."
+        ), context
+
+    what = _titles_phrase([event for event, _, _ in items])
+    if kind == "set":
+        question, done = f"Make {what} {_human_minutes(value)} long", f"Made {what} {_human_minutes(value)} long."
+    elif kind == "add":
+        verbs = ("Extend", "Extended") if value >= 0 else ("Shorten", "Shortened")
+        by = _human_minutes(abs(value))
+        question, done = f"{verbs[0]} {what} by {by}", f"{verbs[1]} {what} by {by}."
+    else:
+        clock = f"{items[0][2]:%I:%M %p}"
+        question, done = f"Make {what} end at {clock}", f"Made {what} end at {clock}."
+    if len(items) == 1 and kind != "end":
+        question += f", until {items[0][2]:%I:%M %p}"
+    return _finish_time_change(items, context, question, done)
 
 
 def _do_update_many(pending, context):
@@ -1936,10 +2205,10 @@ def _do_update_many(pending, context):
     if error:
         traceback.print_exception(error)
         return (
-            f"I moved {done} of {len(pending['items'])} events before something "
+            f"I changed {done} of {len(pending['items'])} events before something "
             "went wrong with the calendar."
         ), context
-    return f"Moved {pending['spoken']}.", context
+    return pending["done"], context
 
 
 def _apply_to_all(intent, targets, text, context, note=""):
@@ -1949,7 +2218,14 @@ def _apply_to_all(intent, targets, text, context, note=""):
     if intent == "UPDATE":
         context["pending"] = None
         return _prepare_bulk_move(targets, text, context)
+    if intent == "RESIZE":
+        context["pending"] = None
+        return _prepare_resize(targets, text, context)
+    if intent == "RENAME":
+        return _do_rename(targets, text, context)
     what = _titles_phrase(targets)
+    if intent == "COLOR" and _one_series(targets):
+        what = _series_phrase(targets)
     ids = [event["id"] for event in targets]
     # Occurrences of a repeating event are recolored at the series (one call,
     # and the whole series follows).
@@ -1996,6 +2272,10 @@ def _apply_to_target(intent, target, text, context):
     trivially reversible, so it just happens."""
     if intent == "COLOR":
         return _do_color(target, text, context)
+    if intent == "RESIZE":
+        return _prepare_resize([target], text, context)
+    if intent == "RENAME":
+        return _do_rename([target], text, context)
     return _prepare_confirmation(intent, target, text, context)
 
 
@@ -2047,6 +2327,43 @@ def _prepare_confirmation(intent, target, text_for_time, context):
         "spoken": spoken,
     }
     return f"Move {spoken}?", context
+
+
+# Things the app can't do yet. Answered here, in plain Python: left to the
+# chat model, a small model happily replies "I'll invite Sam to your meeting".
+_UNSUPPORTED = [
+    (re.compile(r"\binvite\b|\bsend\s+(?:an?\s+)?invit|\bshare\s+(?:my|the|this)\s+(?:calendar|event|meeting)", re.IGNORECASE),
+     "invite people"),
+    (re.compile(r"\bremind(?:er|ers)?\b|\balert\s+me\b|\bnotify\b|\b(?:set|start)\s+an?\s+(?:alarm|timer)\b", re.IGNORECASE),
+     "set reminders, alarms or timers"),
+]
+# A calendar-sounding command the app didn't understand: an edit verb next to a
+# calendar word. (A plain chat message has neither.)
+_CALENDAR_VERB = re.compile(
+    r"\b(?:add|create|schedule|book|move|reschedule|delete|cancel|remove|change|update|"
+    r"extend|shorten|lengthen|shift|push|postpone|put)\b",
+    re.IGNORECASE,
+)
+_CALENDAR_NOUN = re.compile(
+    r"\b(?:calendar|schedule|events?|meetings?|appointments?|blocks?|breaks?|class(?:es)?|"
+    r"sessions?|study|tests?|exams?|quizz?(?:es)?|lessons?|homework|dinner|lunch)\b",
+    re.IGNORECASE,
+)
+
+
+def _unhandled_reply(text):
+    """What to say to a request that isn't a calendar request the app
+    understood, or None if it's ordinary conversation (which goes to chat)."""
+    for pattern, what in _UNSUPPORTED:
+        if pattern.search(text):
+            return f"I can't {what} yet."
+    if _CALENDAR_VERB.search(text) and _CALENDAR_NOUN.search(text):
+        return (
+            "I didn't catch that as a calendar change. Try saying it plainly, like "
+            "'add a break at 3pm', 'move my break to 4pm', 'make my break 30 minutes "
+            "long', 'delete the 7pm one' or 'make it red'."
+        )
+    return None
 
 
 def handle_calendar_request(user_text, context, skip_read=False):
@@ -2105,7 +2422,7 @@ def handle_calendar_request(user_text, context, skip_read=False):
         if named:
             candidates = _scope_to_days(candidates, named)
         # "all of them" / "each": the answer to "which one?" is every one.
-        if pending["intent"] in ("COLOR", "DELETE", "UPDATE") and _WANTS_ALL.search(user_text):
+        if pending["intent"] in ("COLOR", "DELETE", "UPDATE", "RESIZE", "RENAME") and _WANTS_ALL.search(user_text):
             if not named:
                 candidates = _expand_to_group(candidates, time_utils.now())
             return _apply_to_all(pending["intent"], candidates, pending["original_text"], context)
@@ -2133,7 +2450,7 @@ def handle_calendar_request(user_text, context, skip_read=False):
     print(f"  [calendar intent: {intent}]")
 
     if intent == "NONE":
-        return None, context
+        return _unhandled_reply(user_text), context
 
     if intent == "TIME":
         return _do_time(user_text), context
@@ -2186,7 +2503,11 @@ def handle_calendar_request(user_text, context, skip_read=False):
         time_utils.start_of_day(today),
         time_utils.end_of_day(today + datetime.timedelta(days=TARGET_DAYS - 1)),
     )
-    status, result = _resolve_target(user_text, events, context)
+    # For a rename, only the part that names the events finds them -- not the
+    # new name ("rename my break to friday plan" isn't about Friday).
+    renamed = _parse_rename(user_text) if intent == "RENAME" else None
+    resolve_text = renamed[0] if renamed else user_text
+    status, result = _resolve_target(resolve_text, events, context)
 
     if status == "NONE":
         return (
@@ -2195,17 +2516,22 @@ def handle_calendar_request(user_text, context, skip_read=False):
         ), context
 
     if (
-        status == "MANY" and intent in ("COLOR", "DELETE", "UPDATE")
-        and (_WANTS_ALL.search(user_text) or _says_plural(user_text, result))
+        status == "MANY" and intent in ("COLOR", "DELETE", "UPDATE", "RESIZE", "RENAME")
+        and (
+            _WANTS_ALL.search(resolve_text) or _says_plural(resolve_text, result)
+            # Days of one repeating event are one thing to rename or recolor
+            # (that happens to the whole series anyway) -- nothing to choose.
+            or (intent in ("COLOR", "RENAME") and _one_series(result))
+        )
     ):
         # Only the next week was searched, so say so before deleting -- unless
         # they all came from one request (then that whole request is meant,
         # however far ahead it runs), or a day was named.
         whole = result
-        if not _named_days(user_text):
+        if not _named_days(resolve_text):
             whole = _expand_to_group(result, time_utils.now())
         complete = whole is not result or result is context.get("last_batch")
-        searched_week = not _named_days(user_text) and not complete
+        searched_week = not _named_days(resolve_text) and not complete
         return _apply_to_all(
             intent, whole, user_text, context,
             note=" over the next 7 days" if searched_week else "",
