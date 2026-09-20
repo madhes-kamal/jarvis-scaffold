@@ -101,7 +101,9 @@ def _normalize_bare_times(text):
             return f"{digits[:2]}:{digits[2:]}"
         return digits
 
-    return re.sub(r"\b(\d{3,4})\b", _replace, text)
+    # The lookahead also lets "430pm" (no space) through, where there's no
+    # word boundary between the digits and the "pm".
+    return re.sub(r"\b(\d{3,4})(?=\b|[ap]m\b)", _replace, text)
 
 
 def _normalize_meridian(text):
@@ -285,47 +287,77 @@ def _local_iso(dt):
     return dt.replace(tzinfo=datetime.datetime.now().astimezone().tzinfo).isoformat()
 
 
+# Month names only count when a day number follows ("may 5"), so the verb
+# "may" in "may you move it" isn't mistaken for a date.
 _DAY_WORDS = re.compile(
     r"\b(tomorrow|today|tonight|monday|tuesday|wednesday|thursday|friday|"
-    r"saturday|sunday|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
-    r"\d{1,2}(st|nd|rd|th))\b",
+    r"saturday|sunday|\d{1,2}(st|nd|rd|th)|"
+    r"(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2})\b",
     re.IGNORECASE,
 )
 
 
+# A spoken clock time: "11am", "4:30 pm", "4.30pm", "16:00", "noon", "midnight".
+# Bare hours with no am/pm and no minutes ("to 5") deliberately don't match --
+# there's no telling which 5 was meant.
+_CLOCK_TIME = re.compile(
+    r"\b(?P<hour>\d{1,2})(?:[:.](?P<minute>\d{2}))?\s*(?P<meridian>am|pm)\b"
+    r"|\b(?P<h24>\d{1,2})[:.](?P<m24>\d{2})\b"
+    r"|\b(?P<word>noon|midnight)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_clock_time(text):
+    """Return (hour, minute, span) for the LAST clock time in `text` (the
+    last one, because in "move it from 3pm to 4pm" the destination is what
+    matters), or None. Done with a regex rather than dateparser: dateparser
+    reads "to 11am" / "to 10am" as the MONTH (November / October) and throws
+    the time away, which turned every such move into 12:00 AM."""
+    for match in reversed(list(_CLOCK_TIME.finditer(text))):
+        if match["word"]:
+            return (12 if match["word"].lower() == "noon" else 0), 0, match.span()
+        if match["meridian"]:
+            hour, minute = int(match["hour"]), int(match["minute"] or 0)
+            if not (1 <= hour <= 12 and minute < 60):
+                continue
+            hour = hour % 12 + (12 if match["meridian"].lower() == "pm" else 0)
+            return hour, minute, match.span()
+        hour, minute = int(match["h24"]), int(match["m24"])
+        if hour < 24 and minute < 60:
+            return hour, minute, match.span()
+    return None
+
+
 def _extract_new_time(text_for_time, base_date):
     """Find a new time inside a sentence that has other words around it
-    (e.g. "move it to 4pm" or "move it to 4.30"). Uses search_dates, not
-    parse -- parse expects the WHOLE string to be a date. Prefers a match
-    that looks like an actual clock time (colon OR period separator,
-    am/pm, etc.) over a bare date. Unless the message explicitly names a
-    different day, the result is forced to stay on base_date's day --
-    dateparser was silently jumping the result to a different day
-    entirely when given an ambiguous bare time with no am/pm."""
+    (e.g. "move it to 4pm" or "move it to 4.30").
+
+    The clock time comes from _parse_clock_time. The DAY is base_date's day
+    unless the message names another one ("tomorrow", "friday", "the 25th"),
+    in which case dateparser resolves just that day word -- with the clock
+    time cut out first, so it can't misread "11am" as a month."""
     text_for_time = _normalize_meridian(text_for_time)
     text_for_time = _normalize_bare_times(text_for_time)
-    found = search_dates(
-        text_for_time,
-        settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": base_date},
-    )
-    print(f"  [search_dates found: {found}]")
-    if not found:
+    clock = _parse_clock_time(text_for_time)
+    print(f"  [clock time found: {clock}]")
+    if not clock:
         return None
+    hour, minute, (start, end) = clock
 
-    time_like = [
-        (t, dt) for t, dt in found
-        if re.search(r"(:\d{2}|\.\d{2}|am|pm|o'clock|noon|midnight)", t.lower())
-    ]
-    if not time_like:
-        return None
-    matched_text, new_dt = time_like[-1]
-
-    if not _DAY_WORDS.search(text_for_time):
-        new_dt = new_dt.replace(
-            year=base_date.year, month=base_date.month, day=base_date.day
+    day = base_date.date()
+    if _DAY_WORDS.search(text_for_time):
+        without_clock = text_for_time[:start] + " " + text_for_time[end:]
+        found = search_dates(
+            without_clock,
+            settings={"PREFER_DATES_FROM": "future", "RELATIVE_BASE": base_date},
         )
+        print(f"  [search_dates found: {found}]")
+        days = [dt for matched, dt in (found or []) if _DAY_WORDS.search(matched)]
+        if days:
+            day = days[-1].date()
 
-    return new_dt
+    return datetime.datetime.combine(day, datetime.time(hour, minute))
 
 
 def _do_delete(target, context):

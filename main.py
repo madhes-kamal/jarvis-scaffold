@@ -3,6 +3,9 @@ main.py
 
 Run this with: python main.py
 
+Jarvis sleeps until a wake-word model hears "Hey Jarvis" (voice.py), then
+records the request and runs the flow below.
+
 Flow for every message:
 1. If it contains "good morning", speak the tuned briefing.
 2. Ask calendar_manager to classify + (if relevant) handle it -- covers
@@ -21,22 +24,27 @@ Press Ctrl+C to exit.
 import re
 import traceback
 
-from voice import listen, speak
+from voice import listen, speak, wait_for_wake_word
 from calendar_service import get_todays_events
 from brief_generator import generate_brief
 from conversation import run_turn
 from calendar_manager import handle_calendar_request, awaiting_answer, clear_pending
 
-WAKE_PATTERN = r"\bhey\s+jarvis\b[:,]?\s*"
+# The wake word itself is detected by a dedicated model (see voice.py), not
+# by reading transcripts. This only cleans up the few words of it that can
+# land at the start of a request ("Hey Jarvis, what's..." said in one go).
+WAKE_PATTERN = r"^\W*(?:hey[\s,]+)?jarvis\b[\s,:.!?-]*"
 
-# How long to wait for the user to START answering a question Jarvis
-# just asked (e.g. "Delete X?") before giving up and dropping it.
+# How long to wait for the user to START speaking -- an answer to a
+# question Jarvis just asked ("Delete X?"), or the request after waking
+# him -- before giving up. Also what ends a false wake.
 ANSWER_TIMEOUT = 8
+REQUEST_TIMEOUT = 8
 
 
 def _strip_wake_word(text):
-    """Remove the wake phrase and any punctuation Whisper left behind, so
-    a bare "Hey Jarvis!" comes out empty instead of as "!"."""
+    """Remove a leading wake phrase and any punctuation Whisper left
+    behind, so a bare "Hey Jarvis!" comes out empty instead of as "!"."""
     text = re.sub(WAKE_PATTERN, "", text, count=1, flags=re.IGNORECASE)
     text = text.strip().lstrip(" ,.!?;:-")
     return text if re.search(r"\w", text) else ""
@@ -60,15 +68,12 @@ def main():
                 clear_pending(calendar_context)
                 continue
         else:
-            heard = listen(show_status=False)
-            if not re.search(WAKE_PATTERN, heard, re.IGNORECASE):
-                continue
-
-            user_text = _strip_wake_word(heard)
+            wait_for_wake_word()
+            user_text = _strip_wake_word(
+                listen(prompt="Listening for your request...", timeout=REQUEST_TIMEOUT)
+            )
             if not user_text:
-                user_text = listen(prompt="Listening for your request...")
-                if not user_text.strip():
-                    continue
+                continue
 
         print(f"You said: {user_text}")
 

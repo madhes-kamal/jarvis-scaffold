@@ -9,3 +9,6 @@ soundfile
 edge-tts
 playsound==1.2.2
 PyAudio
+numpy
+openwakeword
+onnxruntime

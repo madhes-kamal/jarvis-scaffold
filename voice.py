@@ -3,6 +3,9 @@ voice.py
 
 Speech-to-text and text-to-speech.
 
+- Wake word: openWakeWord's pretrained "hey jarvis" model, running on the
+  raw mic audio (tiny, local, no transcription involved -- Whisper only
+  runs once you've actually woken Jarvis up)
 - STT: faster-whisper running on your machine (free, local)
 - TTS: edge-tts, using Microsoft's neural voices (free, no API key,
   MUCH more natural than pyttsx3 -- the one catch is it needs internet,
@@ -15,17 +18,34 @@ working around it.
 """
 
 import asyncio
+import atexit
 import io
 import os
 import tempfile
 
 import edge_tts
+import numpy as np
 import playsound
 import speech_recognition as sr
 from faster_whisper import WhisperModel
+from openwakeword.model import Model as WakeModel
 
 _recognizer = sr.Recognizer()
 _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+
+# openWakeWord wants 16 kHz mono int16 audio in 80 ms (1280-sample) frames.
+SAMPLE_RATE = 16000
+CHUNK = 1280
+
+# Pretrained model name (ships with openWakeWord) and how confident it must
+# be, 0-1. Lower it if Jarvis misses you; raise it if it wakes on its own.
+# A wake prints "[wake word heard, score ...]" so you can see where you sit.
+WAKE_MODEL = "hey_jarvis"
+WAKE_THRESHOLD = 0.5
+
+# The ONNX backend needs only onnxruntime (the default tflite one doesn't
+# install cleanly on every platform).
+_wake_model = WakeModel(wakeword_models=[WAKE_MODEL], inference_framework="onnx")
 
 # Skips per-utterance language detection (faster, and stops short clips
 # being misdetected as another language). Set to None to auto-detect.
@@ -40,18 +60,62 @@ VOICE = "en-GB-RyanNeural"
 RATE = "+25%"
 
 
-_calibrated = False
+_mic = None
+_source = None
 
 
-def _calibrate(source):
-    """Measure background noise ONCE per run. Doing this on every listen()
-    cost half a second each time, during which the start of a short reply
-    like "yes" could be swallowed as "background noise". After this, the
-    recognizer's dynamic_energy_threshold keeps adapting on its own."""
-    global _calibrated
-    if not _calibrated:
-        _recognizer.adjust_for_ambient_noise(source, duration=1)
-        _calibrated = True
+def _close_mic():
+    if _mic is not None:
+        try:
+            _mic.__exit__(None, None, None)
+        except Exception:
+            pass
+
+
+def _get_source():
+    """The ONE microphone stream the whole app shares, opened on first use.
+
+    Wake-word detection and command recording read from the same stream, so
+    nothing is lost in a gap between "Hey Jarvis" and the start of the
+    request (closing and reopening the mic in between clipped the first
+    words of "Hey Jarvis, what's on my calendar"). Background noise is
+    measured once, here; after that the recognizer's
+    dynamic_energy_threshold keeps adapting on its own."""
+    global _mic, _source
+    if _source is None:
+        _mic = sr.Microphone(sample_rate=SAMPLE_RATE, chunk_size=CHUNK)
+        _source = _mic.__enter__()
+        atexit.register(_close_mic)
+        _recognizer.adjust_for_ambient_noise(_source, duration=1)
+    return _source
+
+
+def _flush_input():
+    """Discard audio that piled up while nobody was reading the stream --
+    mainly Jarvis's own voice from the speakers, which would otherwise be
+    heard as the user's answer."""
+    if _source is None:
+        return
+    stream = _source.stream.pyaudio_stream
+    try:
+        while (available := stream.get_read_available()) > 0:
+            stream.read(available, exception_on_overflow=False)
+    except OSError:
+        pass
+
+
+def wait_for_wake_word():
+    """Block until "Hey Jarvis" is heard. Runs the wake model on every
+    80 ms of mic audio; no speech-to-text is involved."""
+    source = _get_source()
+    _flush_input()
+    _wake_model.reset()
+    while True:
+        frame = np.frombuffer(source.stream.read(CHUNK), dtype=np.int16)
+        score = max(_wake_model.predict(frame).values())
+        if score >= WAKE_THRESHOLD:
+            print(f"  [wake word heard, score {score:.2f}]")
+            return
 
 
 def _transcribe(audio):
@@ -77,14 +141,13 @@ def listen(prompt="Listening... (speak now)", show_status=True, timeout=None):
     timeout: seconds to wait for speech to START before giving up and
     returning "" (None = wait forever).
     """
-    with sr.Microphone() as source:
-        if show_status:
-            print(prompt)
-        _calibrate(source)
-        try:
-            audio = _recognizer.listen(source, timeout=timeout)
-        except sr.WaitTimeoutError:
-            return ""
+    source = _get_source()
+    if show_status:
+        print(prompt)
+    try:
+        audio = _recognizer.listen(source, timeout=timeout)
+    except sr.WaitTimeoutError:
+        return ""
 
     if show_status:
         print("Transcribing...")
@@ -108,3 +171,4 @@ def speak(text):
     """Speak text out loud. Requires internet (edge-tts is a cloud voice)."""
     print(f"Jarvis: {text}")
     asyncio.run(_speak_async(text))
+    _flush_input()

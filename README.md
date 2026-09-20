@@ -13,7 +13,7 @@ model pick an event or act on a guess.
 - `brief_generator.py` — builds the morning briefing from templates in Python (no LLM involved — guarantees accuracy, used only when you say "good morning")
 - `conversation.py` — general chat fallback for anything not calendar-related, plus the phrase-cleanup helper `calendar_manager.py` reuses for create
 - `llm_client.py` — the single place every LLM call goes through; swap models or backends here, not in the other files
-- `voice.py` — speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
+- `voice.py` — wake-word detection (openWakeWord), speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
 - `main.py` — the voice loop; ties everything above together
 
 ## Setup
@@ -59,9 +59,10 @@ constant.
 python main.py
 ```
 
-Say "Hey Jarvis" followed by your request. Each utterance is transcribed
-locally, and Jarvis only responds when the transcript contains the wake
-phrase. Try:
+Say "Hey Jarvis", then your request (in the same breath or after a
+pause). A small dedicated wake-word model (openWakeWord's pretrained
+"hey jarvis") listens to the raw mic audio; Whisper only runs once it
+fires, so nothing is transcribed while Jarvis is idle. Try:
 
 - "What's on my calendar today?"
 - "Add a 5 minute scrolling break starting now"
@@ -86,6 +87,14 @@ Banana, gray → Graphite, plus Sage and Lavender; the palette is defined in
 
 Press `Ctrl+C` to exit.
 
+**Wake word tuning:** every wake prints `[wake word heard, score 0.94]`.
+If Jarvis misses you, lower `WAKE_THRESHOLD` in `voice.py` (default 0.5);
+if it wakes on similar-sounding phrases ("Hey Travis"), raise it. A false
+wake is harmless — it just times out after `REQUEST_TIMEOUT` seconds of
+silence. The models ship with the pip package; on a fresh install, if the
+model file is missing, run
+`python -c "import openwakeword; openwakeword.utils.download_models()"`.
+
 ## Debugging tips
 
 - To test the calendar logic without voice in the way:
@@ -107,7 +116,9 @@ Press `Ctrl+C` to exit.
   `voice.py` (`WhisperModel("small", ...)` instead of `"base"`) — slower,
   more accurate. Whisper's VAD filter and no-speech check are on, so
   silence and room noise should transcribe to nothing.
-- If nothing happens when you talk, check your OS's microphone
+- If Jarvis never wakes, look for the `[wake word heard ...]` line: if it never
+  appears, lower `WAKE_THRESHOLD` or check the mic level (Windows Sound
+  settings → Input). If it wakes but nothing is transcribed, check your OS's microphone
   permissions for your terminal/VS Code — this trips up a lot of people
   on Mac and Windows.
 - Errors during a request (a Google API failure, Ollama not running) are
