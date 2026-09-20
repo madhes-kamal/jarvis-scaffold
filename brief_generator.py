@@ -2,7 +2,9 @@
 brief_generator.py
 
 Builds the morning briefing entirely in Python from templates, rather than
-asking an LLM to write it.
+asking an LLM to write it. It is given only the events that haven't
+finished yet (calendar_service.get_upcoming_events), so a brief asked for at
+noon doesn't recite the morning.
 
 Why: at low temperature (needed for accuracy), a small local model barely
 varies its own phrasing no matter what style hint you give it -- and
@@ -42,10 +44,12 @@ CLOSERS = [
     "That's everything on the schedule.",
 ]
 
+# The brief only covers what hasn't finished yet, so these have to be true
+# whether the day was empty or everything is already behind you.
 NO_EVENTS_LINES = [
-    "There's nothing on the calendar today, sir -- a rare clean slate.",
-    "Good news, sir: your calendar is completely clear today.",
-    "Nothing scheduled today, sir.",
+    "There's nothing left on the calendar today, sir -- a clean slate.",
+    "Good news, sir: your calendar is clear for the rest of today.",
+    "Nothing else scheduled today, sir.",
 ]
 
 
@@ -61,7 +65,7 @@ def _format_event_list(events):
             time_str = f"from {e['start']} to {e['end']}"
 
         if i == 0:
-            sentence = f"Today starts with {e['summary']} {time_str}"
+            sentence = f"First up is {e['summary']} {time_str}"
         else:
             connector = random.choice(TRANSITIONS)
             sentence = f"{connector}, there's {e['summary']} {time_str}"

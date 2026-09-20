@@ -25,7 +25,7 @@ import re
 import traceback
 
 from voice import listen, speak, wait_for_wake_word
-from calendar_service import get_todays_events
+from calendar_service import get_upcoming_events
 from brief_generator import generate_brief
 from conversation import run_turn
 from calendar_manager import handle_calendar_request, awaiting_answer, clear_pending
@@ -96,7 +96,7 @@ def main():
 def _handle_request(user_text, history, calendar_context):
     said_good_morning = "good morning" in user_text.lower()
     if said_good_morning:
-        speak(generate_brief(get_todays_events()))
+        speak(generate_brief(get_upcoming_events()))
 
     reply, calendar_context = handle_calendar_request(
         user_text, calendar_context, skip_read=said_good_morning

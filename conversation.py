@@ -11,11 +11,11 @@ for why. Nothing here calls ollama directly or hardcodes a model name.
 
 import datetime
 
-from calendar_service import get_todays_events, create_event
+from calendar_service import get_upcoming_events, create_event
 from llm_client import chat_completion
 
 AVAILABLE_TOOLS = {
-    "get_todays_events": get_todays_events,
+    "get_upcoming_events": get_upcoming_events,
     "create_event": create_event,
 }
 
@@ -73,11 +73,44 @@ def extract_event_phrase(user_text, events_context=None):
     return message["content"]
 
 
+def extract_event_title(user_text):
+    """Just the TITLE of the event being created: "Schedule a chemistry test
+    next Friday at 2.30 p.m." -> "Chemistry test". Dates and times are worked
+    out in Python (calendar_manager._parse_new_event); a small model given
+    the whole job turned "next Friday" into a Sunday, so it only names the
+    event now. Returns "" if the reply looks unusable."""
+    message = chat_completion(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Extract the title of the calendar event the user wants "
+                    "to create. Reply with ONLY the title: 1 to 4 words, no "
+                    "quotes, no final punctuation. Leave out the command "
+                    "(add, schedule, create), dates, times and durations.\n\n"
+                    "Examples:\n"
+                    "'Schedule a chemistry test next Friday at 2.30 p.m.' -> Chemistry test\n"
+                    "'add a 5 minute scrolling break starting now' -> Scrolling break\n"
+                    "'put dinner with grandma tomorrow from 7 to 8pm' -> Dinner with grandma\n"
+                    "'create a study session for physics on Thursday at 5' -> Physics study session"
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.0,
+    )
+    lines = message["content"].strip().splitlines()
+    title = lines[0].strip().strip("\"'").rstrip(".!") if lines else ""
+    return title if 1 <= len(title.split()) <= 8 else ""
+
+
 def _system_prompt():
     now = datetime.datetime.now()
     return f"""You are a casual, friendly personal assistant (like JARVIS,
 but relaxed, not formal). You can read and modify the user's Google
-Calendar using the tools you're given.
+Calendar using the tools you're given. If the user asks about their
+schedule, call get_upcoming_events right away (days=1 is the rest of today,
+days=7 the next week) -- never offer to check or ask permission first.
 
 Today's date and time: {now.strftime("%A, %B %d, %Y, %I:%M %p")}.
 
@@ -98,7 +131,7 @@ def run_turn(user_message, history):
     messages = [{"role": "system", "content": _system_prompt()}] + history
     messages.append({"role": "user", "content": user_message})
 
-    message = chat_completion(messages, tools=[get_todays_events, create_event])
+    message = chat_completion(messages, tools=[get_upcoming_events, create_event])
     messages.append(message)
 
     tool_calls = message["tool_calls"]
