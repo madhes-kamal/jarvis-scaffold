@@ -39,7 +39,7 @@ from calendar_service import (
     delete_event, delete_events, update_event, update_events,
     set_event_color, set_event_colors, set_event_titles,
 )
-from conversation import extract_event_title
+from conversation import extract_event_title, extract_search_target
 from llm_client import chat_completion
 
 VALID_INTENTS = {"CREATE", "READ", "UPDATE", "DELETE", "COLOR", "TIME", "RESIZE", "RENAME", "NONE"}
@@ -1653,7 +1653,7 @@ _SEARCH_STOPWORDS = {
     "list", "read", "out", "for", "in", "at", "to", "of", "and", "or", "look",
     "looks", "like", "going", "get", "got", "how", "when", "am", "be", "busy",
     "free", "plans", "happening", "can", "could", "you", "please", "give",
-    "check", "see", "hey", "jarvis", "later", "left", "rest", "else", "other",
+    "check", "see", "hey", "later", "left", "rest", "else", "other",
     "all", "everything", "much", "full", "packed", "now", "still", "just",
     "so", "okay", "ok", "um", "uh", "it", "that", "this", "we", "will", "would",
     "about", "appointment", "appointments", "per", "time", "start", "starts",
@@ -1794,7 +1794,17 @@ def _do_read(user_text, context):
     ref = time_utils.now()
     today = ref.date()
     date_range = time_utils.parse_date_range(user_text, ref)
-    terms = _search_terms(user_text) if _SPECIFIC_SEARCH.search(user_text) else set()
+
+    # _SPECIFIC_SEARCH is a cheap pre-filter ("do I have", "is there", "any",
+    # ...) that over-triggers on plenty of perfectly generic requests ("what
+    # do I have scheduled after today" contains "do I have" but names
+    # nothing). Only when it fires is the small model asked what the message
+    # is actually naming -- a narrow rewrite job, the same kind extract_
+    # event_title does for CREATE -- which also filters out any greeting or
+    # chit-chat a raw stopword-diff over the whole transcript couldn't tell
+    # apart from a real search term.
+    search_target = extract_search_target(user_text) if _SPECIFIC_SEARCH.search(user_text) else ""
+    terms = _search_terms(search_target) if search_target else set()
 
     if date_range is None:
         if terms:
@@ -1804,7 +1814,7 @@ def _do_read(user_text, context):
             )
         else:
             date_range = time_utils.DateRange(ref, time_utils.end_of_day(today), "today")
-    print(f"  [read: {date_range.label}, search terms: {sorted(terms)}]")
+    print(f"  [read: {date_range.label}, search target: {search_target!r}, terms: {sorted(terms)}]")
 
     events = get_events(date_range.start, date_range.end)
     if terms:
@@ -2000,6 +2010,17 @@ _SET_LENGTH = re.compile(
 _END_AT = re.compile(
     r"\bend(?:s|ing)?\s+(?:time\s+)?(?:to\s+|at\s+|by\s+)?(?=\d|noon\b|midnight\b)", re.IGNORECASE
 )
+# "add A break ... that's ten minutes long" is creating a new, unspecified
+# event, not resizing an existing one -- unlike "make MY break ... minutes
+# long" or "make IT an hour long", which refer to something already on the
+# calendar. The indefinite article right after a creation verb is what marks
+# it as new, so this guard stops _parse_resize from firing on it. "at" is
+# included because Whisper reliably mishears "add" as "at" ("At a break
+# after Jarvis..."); "at a/an" otherwise only precedes a clock time in this
+# app's phrasing ("at 3pm"), which never matches "a"/"an", so it's safe.
+_NEW_EVENT_PHRASE = re.compile(
+    r"\b(?:add|create|schedule|book|put|make|at)\s+(?:a|an)\b", re.IGNORECASE
+)
 # What a length or end-time request adds to the message: none of it says WHICH
 # events, and "35 minutes" must not be read as the hour 35.
 _LENGTH_WORDS = re.compile(
@@ -2050,6 +2071,8 @@ def _parse_resize(text):
     minutes after midnight). value is None when the message doesn't say how
     much ("make it longer"), so Jarvis can ask."""
     lowered = text.lower().replace("’", "'")
+    if _NEW_EVENT_PHRASE.search(lowered):
+        return None
     if found := _END_AT.search(lowered):
         return "end", _answer_time(lowered[found.end():])
     minutes = _parse_length_minutes(lowered)

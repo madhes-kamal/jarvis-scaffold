@@ -107,6 +107,54 @@ def extract_event_title(user_text):
     return title if 1 <= len(title.split()) <= 8 else ""
 
 
+def extract_search_target(user_text):
+    """The specific thing (if any) a calendar READ is asking about --
+    "chemistry test" from "do I have a chemistry test this week", or ""
+    when the message is really just a generic "what's on my calendar" with
+    nothing specific named.
+
+    calendar_manager.py used to answer this with plain stopword-removal
+    over the whole raw transcript, which had no way to tell a real search
+    term apart from chit-chat or a misheard wake word ("Google, Google, how
+    are you doing bro, what do I have scheduled after today" was leaving
+    behind {'after', 'bro', 'doing', 'google'} as "search terms", so nothing
+    ever matched). This is the same kind of narrow, single-phrase job as
+    extract_event_title -- reading intent out of messy speech -- just for
+    reading instead of creating."""
+    message = chat_completion(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "The user is asking about their calendar. If they're asking "
+                    "whether a SPECIFIC named event, appointment, test, or activity "
+                    "is scheduled, reply with ONLY that thing, 1-4 words. If they're "
+                    "just asking generally what's on their schedule/calendar/day/"
+                    "week, with nothing specific named, reply with exactly NONE. "
+                    "Ignore any greeting, small talk, or filler in the message -- "
+                    "it is never part of what to search for.\n\n"
+                    "Examples:\n"
+                    "'do I have a chemistry test this week' -> chemistry test\n"
+                    "'is there a dentist appointment tomorrow' -> dentist appointment\n"
+                    "'any meetings this week' -> meetings\n"
+                    "'what do I have today' -> NONE\n"
+                    "'what's on my calendar' -> NONE\n"
+                    "'how does my week look' -> NONE\n"
+                    "'hey buddy what do I have scheduled after today' -> NONE\n"
+                    "'how many things do I have going on friday' -> NONE\n\n"
+                    "Reply with ONLY the phrase or NONE, nothing else."
+                ),
+            },
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.0,
+    )
+    text = message["content"].strip().strip("\"'").rstrip(".!")
+    if not text or text.upper() == "NONE" or len(text.split()) > 5:
+        return ""
+    return text
+
+
 def _system_prompt():
     now = datetime.datetime.now()
     return f"""You are a casual, friendly personal assistant (like JARVIS,

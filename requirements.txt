@@ -13,3 +13,4 @@ numpy
 openwakeword
 onnxruntime
 python-dateutil
+requests

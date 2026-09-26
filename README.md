@@ -14,6 +14,7 @@ model pick an event or act on a guess.
 - `brief_generator.py` — builds the morning briefing from templates in Python (no LLM involved — guarantees accuracy, used only when you say "good morning")
 - `heads_up.py` — the look-ahead part of "good morning": finds tests/quizzes/deadlines in the next 14 days, checks whether prep time is scheduled, and plans study blocks around what's already on your calendar
 - `conversation.py` — general chat fallback for anything not calendar-related, plus `extract_event_title`, the one small job the model does when you add an event (naming it). `extract_event_phrase` is the old "model writes the whole quick-add phrase" helper and is no longer used
+- `news_service.py` — fetches top headlines from NewsAPI.org and builds the spoken news brief from templates in Python (no LLM involved, same reasoning as `brief_generator.py`), used when you ask for the news
 - `llm_client.py` — the single place every LLM call goes through; swap models or backends here, not in the other files
 - `voice.py` — wake-word detection (openWakeWord), speech-to-text (Whisper, local) and text-to-speech (edge-tts, free neural voices, needs internet)
 - `main.py` — the voice loop; ties everything above together
@@ -55,7 +56,20 @@ ollama pull qwen3:1.7b
 The model name lives in exactly one place: `llm_client.py`'s `MODEL`
 constant.
 
-### 4. Run it
+### 4. News (optional)
+
+Get a free key at [newsapi.org/register](https://newsapi.org/register), copy
+`.env.example` to `.env`, and put it in:
+
+```
+NEWS_API_KEY=your-key-here
+```
+
+`.env` is gitignored, so the key never gets committed. Without a key,
+Jarvis still runs fine — asking for the news just gets a short "I don't
+have a news API key set up yet" instead of headlines.
+
+### 5. Run it
 
 ```bash
 python main.py
@@ -80,6 +94,8 @@ fires, so nothing is transcribed while Jarvis is idle. Try:
 - "Delete the 7pm one"
 - "Make my break red" / "Change the color of chemistry to light blue" / "Make it green"
 - "Good morning" (spoken briefing)
+- "What's the news?" / "Give me the headlines" (needs `NEWS_API_KEY`, see Setup step 4)
+- "Hey Jarvis, stop" (cuts Jarvis off, even mid-response -- see "Hey Jarvis, stop" below)
 
 **Time and look-ahead.** Jarvis reads the clock from your computer, and
 reading the calendar only reports events that haven't finished: one in
@@ -101,6 +117,29 @@ each one it counts the study/prep events for the same subject that finish
 review, practice or homework in the title): "…Chemistry test on Friday at 10:00
 AM, with 4 chemistry study blocks lined up before it" or "…and nothing is
 scheduled to prep for it yet, so make sure to prep ahead of that."
+
+**"What's the news?"** Checked before anything calendar-related — like the
+wake word and "good morning", a plain regex (`NEWS_PATTERN` in `main.py`)
+catches "news", "headlines" and "top stories" so a small unrelated model
+never has to decide this isn't a calendar request. `news_service.py` fetches
+top US headlines from NewsAPI.org (`get_headlines`) — the model never picks
+which headlines exist, so it can't drop a real one or invent one that
+wasn't reported. With 2 or more headlines, the small local model is then
+given those exact headlines and sources and asked to narrate them
+naturally, like a person reading the news out loud, instead of the old
+fixed "...from Reuters. Meanwhile, ...from the BBC." template — it's told
+to only reword the delivery, never add a fact, number or detail that isn't
+literally in the headline. `_looks_complete` (`news_service.py`)
+double-checks the model's narration still mentions every headline before
+it's trusted; if the model call fails, or a headline quietly went missing,
+it falls back to the old fixed template instead. A single headline always
+uses the template directly — with nothing to narrate around, asking the
+model added nothing but a chance to invent a second, fake story. Repeated
+requests within 10 minutes (`CACHE_SECONDS`) reuse the last fetch instead
+of spending another call — the free tier is 100 requests/day. No key set,
+or the request fails: a short spoken line says so ("I don't have a news
+API key set up yet, sir." / "I couldn't reach the news service, sir."),
+never a crash or a made-up headline.
 
 If the nearest test with a subject has no prep, the brief ends on an offer, and
 your next words answer it (no wake word): "Want me to add 5 chemistry study
@@ -264,14 +303,29 @@ still ahead today wins over the same title later in the week; name one
 ("delete tomorrow's break", "the friday one") to pick another. Which-one
 questions and confirmations include the day when it isn't today.
 
-**Follow-up questions don't need the wake word.** When Jarvis asks
-something ("Move Break to 04:30 PM?" or "Which one did you mean?"), just
-answer. If you say nothing for 8 seconds (`ANSWER_TIMEOUT` in `main.py`)
-the question is dropped. Anything that isn't a clear yes or no is treated
-as a new request instead of a confirmation, and an unclear answer never
-confirms a delete or move. A yes or no has to be short (a "no" up to 6 words, a
-"yes" up to 8): a long sentence that merely contains "don't" or "sure" is a new
-request, not an answer.
+**Follow-ups don't need the wake word.** For 30 seconds
+(`FOLLOWUP_TIMEOUT` in `main.py`) after any response, you can just keep
+talking -- no need to say "Hey Jarvis" again. That covers answering a
+question Jarvis just asked ("Move Break to 04:30 PM?" or "Which one did
+you mean?") as well as any new, unrelated request. Once 30 seconds pass
+with nothing said, the wake word is required again -- and if it was a
+pending question specifically, it's dropped. Anything that isn't a clear
+yes or no is treated as a new request instead of a confirmation, and an
+unclear answer never confirms a delete or move. A yes or no has to be
+short (a "no" up to 6 words, a "yes" up to 8): a long sentence that merely
+contains "don't" or "sure" is a new request, not an answer.
+
+**"Hey Jarvis, stop".** Say the wake word plus "stop" (or "never mind" /
+"quiet") at any time, even while Jarvis is still mid-sentence, and it cuts
+the response off right there, drops any pending question, and answers
+"Okay, stopping." On Windows this is a real barge-in: while speaking,
+Jarvis keeps listening for the wake word through the same small model used
+to wake it up, and cuts the audio the instant it's heard (see
+`_play_interruptible` in `voice.py`); other platforms fall back to
+uninterruptible playback, so "stop" there only takes effect once the
+current line finishes. Interrupting with something other than "stop" is
+handled the same way as a fresh request -- Jarvis drops what it was saying
+and answers the new one instead.
 
 **Colors:** everyday words are mapped to the nearest Google Calendar event
 color (red → Tomato, blue → Blueberry, light blue → Peacock, green →

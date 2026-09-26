@@ -18,7 +18,11 @@ Flow for every message:
 
 If Jarvis asks a question (confirm a delete/move, or "which one?"), the
 next utterance is treated as the answer without needing "Hey Jarvis"
-again. Silence for ANSWER_TIMEOUT seconds cancels the question.
+again. More generally, for FOLLOWUP_TIMEOUT seconds after ANY response
+you can just keep talking -- no wake word needed; after that long with
+nothing said, "Hey Jarvis" is required again. Saying "Hey Jarvis, stop"
+(or "never mind" / "quiet") at any point -- even while Jarvis is still
+mid-sentence -- cuts the response off and drops whatever was pending.
 
 Press Ctrl+C to exit.
 """
@@ -27,22 +31,38 @@ import re
 import time
 import traceback
 
-from voice import listen, speak, wait_for_wake_word, set_vocabulary
+from voice import listen, speak, wait_for_wake_word, set_vocabulary, BargeIn
 from calendar_service import get_upcoming_events
 from heads_up import build_morning_brief
 from conversation import run_turn
 from calendar_manager import handle_calendar_request, awaiting_answer, clear_pending
+from news_service import build_news_brief
 
 # The wake word itself is detected by a dedicated model (see voice.py), not
 # by reading transcripts. This only cleans up the few words of it that can
 # land at the start of a request ("Hey Jarvis, what's..." said in one go).
 WAKE_PATTERN = r"^\W*(?:hey[\s,]+)?jarvis\b[\s,:.!?-]*"
 
-# How long to wait for the user to START speaking -- an answer to a
-# question Jarvis just asked ("Delete X?"), or the request after waking
-# him -- before giving up. Also what ends a false wake.
-ANSWER_TIMEOUT = 8
+# "what's the news", "give me the headlines", "top stories" -- kept as its
+# own check, same as WAKE_PATTERN and "good morning" below, so a small
+# unrelated model never has to decide this isn't a calendar request.
+NEWS_PATTERN = re.compile(r"\b(?:the\s+)?(?:news|headlines|top stories)\b", re.IGNORECASE)
+
+# A bare cut-it-off command -- has to be the *whole* utterance ("stop", not
+# "stop by the store"), so it never shadows a real request that happens to
+# contain one of these words.
+STOP_PATTERN = re.compile(
+    r"^(?:stop(?:\s+talking)?|never\s*mind|quiet|shut\s+up)[.!]?$", re.IGNORECASE
+)
+
+# How long to wait for the user to START speaking before giving up. REQUEST
+# is the window right after a fresh "Hey Jarvis"; FOLLOWUP is the (longer)
+# window after any response during which no wake word is needed at all --
+# covers both "answer the question Jarvis just asked" and "just keep
+# talking". Once FOLLOWUP_TIMEOUT passes with nothing said, "Hey Jarvis" is
+# required again.
 REQUEST_TIMEOUT = 8
+FOLLOWUP_TIMEOUT = 30
 
 # How often to refresh the words Whisper is told to expect (your event titles).
 VOCABULARY_REFRESH_SECONDS = 1800
@@ -66,6 +86,19 @@ def _refresh_vocabulary():
         pass
 
 
+def _speak_ack(text):
+    """speak() for a short acknowledgement ("Okay, stopping.", the "sorry,
+    something went wrong" fallback) where a failure -- a second barge-in on
+    top of it, or a TTS/network hiccup -- isn't worth chasing; just log it
+    and move on rather than crashing the loop."""
+    try:
+        speak(text)
+    except BargeIn:
+        pass
+    except Exception:
+        traceback.print_exc()
+
+
 def main():
     history = []
     calendar_context = {"last_event": None, "pending": None}
@@ -73,21 +106,37 @@ def main():
     last_refresh = time.monotonic()
     print("Listening for 'Hey Jarvis'. Press Ctrl+C to exit.")
 
+    # Once this many seconds from now pass with nothing said, "Hey Jarvis"
+    # is required again; until then, any speech is treated as a follow-up.
+    awake_until = 0.0
+    # Text already captured (e.g. by a barge-in mid-response) waiting to be
+    # handled -- skips listening again on the next loop.
+    pending_text = None
+
     while True:
         if time.monotonic() - last_refresh > VOCABULARY_REFRESH_SECONDS:
             last_refresh = time.monotonic()  # even on failure: retry in 30 minutes, not every loop
             _refresh_vocabulary()
 
-        if awaiting_answer(calendar_context):
-            # Jarvis just asked a question, so the very next utterance is
-            # the answer -- no wake word needed. (A wake word is still
-            # accepted and stripped if the user says one anyway.)
-            user_text = _strip_wake_word(
-                listen(prompt="Listening for your answer...", timeout=ANSWER_TIMEOUT)
+        if pending_text is not None:
+            user_text = pending_text
+            pending_text = None
+        elif awaiting_answer(calendar_context) or time.monotonic() < awake_until:
+            # Either Jarvis just asked a question, or we're still inside
+            # the no-wake-word window after the last response -- either
+            # way, just keep talking. (A wake word is still accepted and
+            # stripped if the user says one anyway.)
+            prompt = (
+                "Listening for your answer..."
+                if awaiting_answer(calendar_context)
+                else "Listening (no need to say 'Hey Jarvis')..."
             )
+            user_text = _strip_wake_word(listen(prompt=prompt, timeout=FOLLOWUP_TIMEOUT))
             if not user_text:
-                print("  [no answer heard -- dropping the pending question]")
-                clear_pending(calendar_context)
+                if awaiting_answer(calendar_context):
+                    print("  [no answer heard -- dropping the pending question]")
+                    clear_pending(calendar_context)
+                awake_until = 0.0
                 continue
         else:
             wait_for_wake_word()
@@ -99,23 +148,44 @@ def main():
 
         print(f"You said: {user_text}")
 
+        if STOP_PATTERN.match(user_text):
+            clear_pending(calendar_context)
+            _speak_ack("Okay, stopping.")
+            awake_until = 0.0
+            continue
+
         try:
             history, calendar_context = _handle_request(
                 user_text, history, calendar_context
             )
+            awake_until = time.monotonic() + FOLLOWUP_TIMEOUT
+        except BargeIn as e:
+            # "Hey Jarvis" was heard while a reply was still playing, so it
+            # was cut off mid-sentence -- calendar_context/history from this
+            # turn are intentionally NOT saved (the reply may describe a
+            # pending question the user never actually heard in full).
+            # Whatever came right after the wake word -- "stop", nothing,
+            # or a brand new ask -- is handled on the next loop, exactly
+            # like a fresh wake.
+            pending_text = _strip_wake_word(e.text) or None
+            awake_until = 0.0
         except Exception:
             # A failed API call (Google, Ollama, network) shouldn't kill
             # the assistant -- report it, drop any half-finished question,
             # and go back to listening.
             traceback.print_exc()
             clear_pending(calendar_context)
-            try:
-                speak("Sorry, something went wrong with that.")
-            except Exception:
-                traceback.print_exc()
+            _speak_ack("Sorry, something went wrong with that.")
+            awake_until = 0.0
 
 
 def _handle_request(user_text, history, calendar_context):
+    if NEWS_PATTERN.search(user_text):
+        # Standalone, like a TIME question -- headlines aren't calendar
+        # data and don't need the small model's judgment either.
+        speak(build_news_brief())
+        return history, calendar_context
+
     said_good_morning = "good morning" in user_text.lower()
 
     reply, calendar_context = handle_calendar_request(
