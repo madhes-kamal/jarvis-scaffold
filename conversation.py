@@ -13,6 +13,7 @@ import datetime
 
 from calendar_service import get_upcoming_events
 from llm_client import chat_completion
+from web_search import web_search
 
 # Read-only on purpose. Adding, moving, resizing, deleting and recoloring events
 # are all done by calendar_manager.py, which works out dates and times itself;
@@ -20,6 +21,7 @@ from llm_client import chat_completion
 # guessing dates ("next Friday" came out as a Sunday).
 AVAILABLE_TOOLS = {
     "get_upcoming_events": get_upcoming_events,
+    "web_search": web_search,
 }
 
 
@@ -165,6 +167,13 @@ it. If they ask what's on their schedule, call get_upcoming_events right away
 (days=1 is the rest of today, days=7 the next week) -- never offer to check
 or ask permission first.
 
+You can also search the web with web_search for anything current or outside
+your own knowledge -- weather, scores, prices, news events, "who is/what is"
+questions about things that may have changed since you were trained. Call it
+right away when needed, don't ask permission first, and answer using only
+what the results actually say -- never invent a fact the results don't
+support.
+
 Changing the calendar is handled by other parts of this app, and only works
 when the request is specific. If the user asks you to change something, do
 NOT refuse and do not pretend you did it. Ask them to say it plainly, for
@@ -193,7 +202,7 @@ def run_turn(user_message, history):
     messages = [{"role": "system", "content": _system_prompt()}] + history
     messages.append({"role": "user", "content": user_message})
 
-    message = chat_completion(messages, tools=[get_upcoming_events])
+    message = chat_completion(messages, tools=[get_upcoming_events, web_search])
     messages.append(message)
 
     tool_calls = message["tool_calls"]
@@ -203,7 +212,14 @@ def run_turn(user_message, history):
             args = call.function.arguments
             print(f"  [calling tool: {name}({args})]")
             func = AVAILABLE_TOOLS[name]
-            result = func(**args)
+            try:
+                result = func(**args)
+            except Exception as exc:
+                # A tool raising (e.g. web_search when DuckDuckGo is
+                # unreachable) shouldn't crash the whole turn -- hand the
+                # model the short, speakable reason instead so it can
+                # explain rather than silently failing or making something up.
+                result = str(exc)
             messages.append({"role": "tool", "content": str(result), "name": name})
 
         follow_up = chat_completion(messages)

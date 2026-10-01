@@ -53,7 +53,14 @@ def chat_completion(messages, tools=None, temperature=0.2):
         "options": {"temperature": temperature},
         # `think` is a top-level chat() argument, not a model option --
         # inside `options` it was silently ignored.
-        "think": False,
+        #
+        # With tools attached, qwen3 needs think=True or it never emits a
+        # tool call at all -- it just describes what it would do in plain
+        # text instead. think=False is kept for everything else (plain
+        # rewrite/extraction calls) since those don't need it and it's
+        # faster without. Either way _strip_thinking below cleans up any
+        # <think> block that leaks into .content.
+        "think": bool(tools),
     }
     if tools:
         kwargs["tools"] = tools

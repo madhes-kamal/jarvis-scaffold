@@ -33,6 +33,7 @@ import os
 import platform
 import re
 import tempfile
+import threading
 import time
 
 import edge_tts
@@ -182,22 +183,52 @@ def wait_for_wake_word():
             return
 
 
+# A short/quiet clip -- most often just "Hey Jarvis" said out of habit right
+# after a response, with nothing else -- can send Whisper's decoder into a
+# repetition retry loop that takes minutes instead of the usual under a
+# second, which from the outside looks exactly like the assistant freezing
+# permanently (nothing else in the loop runs until this returns). Two
+# mitigations: temperature=0.0 skips the retry-at-higher-temperature fallback
+# that loop happens in, and TRANSCRIBE_TIMEOUT is a hard backstop so a clip
+# that's still slow anyway can never take the whole assistant down with it --
+# it's just treated as unintelligible instead.
+TRANSCRIBE_TIMEOUT = 20
+
+
 def _transcribe(audio):
     """Whisper on the raw wav bytes -- no temp file. The VAD filter and the
     no-speech check are what stop Whisper from inventing text ("Thank you.")
     out of silence or room noise."""
-    segments, _ = _whisper_model.transcribe(
-        io.BytesIO(audio.get_wav_data()),
-        language=WHISPER_LANGUAGE,
-        initial_prompt=_vocabulary_prompt,
-        vad_filter=True,
-        condition_on_previous_text=False,
-    )
-    return " ".join(
-        segment.text.strip()
-        for segment in segments
-        if not (segment.no_speech_prob > 0.6 and segment.avg_logprob < -1.0)
-    ).strip()
+    result = {}
+
+    def run():
+        try:
+            segments, _ = _whisper_model.transcribe(
+                io.BytesIO(audio.get_wav_data()),
+                language=WHISPER_LANGUAGE,
+                initial_prompt=_vocabulary_prompt,
+                vad_filter=True,
+                condition_on_previous_text=False,
+                temperature=0.0,
+            )
+            result["text"] = " ".join(
+                segment.text.strip()
+                for segment in segments
+                if not (segment.no_speech_prob > 0.6 and segment.avg_logprob < -1.0)
+            ).strip()
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(TRANSCRIBE_TIMEOUT)
+    if thread.is_alive():
+        print(f"  [whisper took too long (>{TRANSCRIBE_TIMEOUT}s) -- treating as unintelligible]")
+        return ""
+    if "error" in result:
+        print(f"  [transcription failed: {result['error']}]")
+        return ""
+    return result.get("text", "")
 
 
 def listen(prompt="Listening... (speak now)", show_status=True, timeout=None):
